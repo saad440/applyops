@@ -8,9 +8,24 @@
 <section class="card">
   <h2>Diagnostics</h2>
   <p>
-    This page is rendered on the server by Askama from <code>templates/index.html</code>,
-    which extends <code>templates/base.html</code>, and is styled by the local stylesheet
-    served at <code>/static/css/app.css</code>.
+    This page is rendered on the server by Askama and styled by the local
+    stylesheet at <code>/static/css/app.css</code>. Records below are stored
+    in SQLite and survive application restarts.
   </p>
+  <p>Persistent records: <strong>{{ note_count }}</strong></p>
+  <form method="post" action="/diagnostics/notes" class="note-form">
+    <label for="note">Diagnostic note</label>
+    <input id="note" name="note" type="text" required maxlength="200">
+    <button type="submit">Add</button>
+  </form>
+  {% if notes.is_empty() %}
+  <p class="muted">No notes stored yet.</p>
+  {% else %}
+  <ul class="note-list">
+    {% for entry in notes %}
+    <li><code>{{ entry.created_at }}</code> — {{ entry.note }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
 </section>
 {% endblock %}
