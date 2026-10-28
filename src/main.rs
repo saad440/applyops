@@ -2,24 +2,29 @@
 //!
 //! Starts an HTTP server bound to the loopback interface by default; the
 //! `APPLYOPS_BIND_ADDR` environment variable overrides the listen address.
-//! The routes defined here are a minimal development scaffold; application
-//! features build on the same request path: browser → router → handler → response.
+//! Routes serve Askama-rendered HTML and static assets; application features
+//! build on the same request path: browser → router → handler → template → response.
 
 use std::time::Instant;
 
+use askama::Template;
 use axum::Router;
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 
 /// Default listen address: loopback only, for local single-user use.
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 
 /// Environment variable that overrides the listen address.
 const BIND_ADDR_ENV: &str = "APPLYOPS_BIND_ADDR";
+
+/// Directory of local static assets, resolved relative to the working directory.
+const STATIC_DIR: &str = "static";
 
 /// Resolves the listen address from an optional environment value.
 fn resolve_bind_addr(env_value: Option<String>) -> String {
@@ -31,6 +36,35 @@ fn is_loopback_addr(addr: &str) -> bool {
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Index page, rendered from `templates/index.html` at compile time.
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate;
+
+/// Wraps an Askama template so it can be returned directly from handlers.
+struct HtmlTemplate<T>(T);
+
+impl<T> IntoResponse for HtmlTemplate<T>
+where
+    T: Template,
+{
+    fn into_response(self) -> Response {
+        match self.0.render() {
+            Ok(body) => {
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to render template");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "template rendering failed",
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -50,6 +84,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/healthz", get(health))
+        .nest_service("/static", ServeDir::new(STATIC_DIR))
         .layer(middleware::from_fn(log_requests));
 
     let listener = TcpListener::bind(&bind_addr)
@@ -61,9 +96,9 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
-/// `GET /` — index route.
+/// `GET /` — index page.
 async fn root() -> impl IntoResponse {
-    "ApplyOps is running"
+    HtmlTemplate(IndexTemplate)
 }
 
 /// `GET /healthz` — health check for scripted verification.
@@ -94,9 +129,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn root_responds_with_ok() {
+    async fn root_responds_with_html() {
         let response = root().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&"text/html; charset=utf-8".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn index_template_links_stylesheet() {
+        let html = IndexTemplate.render().expect("index template renders");
+        assert!(html.contains(r#"href="/static/css/app.css""#));
+        assert!(html.contains("ApplyOps"));
     }
 
     #[tokio::test]
