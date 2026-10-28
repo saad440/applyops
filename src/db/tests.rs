@@ -3,6 +3,7 @@
 //! SQLite.
 
 use super::opportunities::*;
+use super::streams::{self, DEFAULT_STREAMS};
 use super::*;
 
 const USER_ID: i64 = 1;
@@ -226,4 +227,88 @@ async fn diagnostic_and_opportunity_tables_coexist() {
 
     assert_eq!(count_notes(&pool).await.unwrap(), 1);
     assert_eq!(count_opportunities(&pool).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn default_streams_seed_only_while_empty() {
+    let pool = migrated_pool().await;
+
+    let first = streams::seed_streams_if_empty(&pool, USER_ID, &DEFAULT_STREAMS)
+        .await
+        .unwrap();
+    assert_eq!(first, DEFAULT_STREAMS.len());
+
+    // A second run finds the table populated and adds nothing.
+    let second = streams::seed_streams_if_empty(&pool, USER_ID, &DEFAULT_STREAMS)
+        .await
+        .unwrap();
+    assert_eq!(second, 0);
+
+    let listed = streams::list_streams(&pool, USER_ID).await.unwrap();
+    assert_eq!(listed.len(), DEFAULT_STREAMS.len());
+    let names: Vec<&str> = listed.iter().map(|stream| stream.name.as_str()).collect();
+    assert_eq!(names, ["IT", "Physics", "Scientific Computing"]);
+}
+
+#[tokio::test]
+async fn inserting_an_existing_stream_returns_the_same_row() {
+    let pool = migrated_pool().await;
+    streams::seed_streams_if_empty(&pool, USER_ID, &DEFAULT_STREAMS)
+        .await
+        .unwrap();
+
+    let seeded_id = streams::insert_stream(&pool, USER_ID, "Physics")
+        .await
+        .unwrap();
+    let again = streams::insert_stream(&pool, USER_ID, "  Physics  ")
+        .await
+        .unwrap();
+    assert_eq!(seeded_id, again);
+
+    let custom = streams::insert_stream(&pool, USER_ID, "Marine Acoustics")
+        .await
+        .unwrap();
+    assert_ne!(seeded_id, custom);
+
+    let listed = streams::list_streams(&pool, USER_ID).await.unwrap();
+    assert_eq!(listed.len(), DEFAULT_STREAMS.len() + 1);
+}
+
+#[tokio::test]
+async fn streams_require_a_known_user() {
+    let pool = migrated_pool().await;
+
+    let err = streams::insert_stream(&pool, 42, "Physics")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, sqlx::Error::Database(_)));
+}
+
+#[tokio::test]
+async fn source_urls_must_be_web_addresses() {
+    let pool = migrated_pool().await;
+
+    let mut new = sample_opportunity();
+    new.source_url = Some("ftp://files.example.org/vacancy".to_string());
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "source_url"
+    );
+
+    new.source_url = Some("https://".to_string());
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "source_url"
+    );
+
+    // The scheme check is case-insensitive; the address is stored verbatim.
+    new.source_url = Some("HTTPS://Example.org/Vacancy".to_string());
+    assert!(validate_new_opportunity(&new).is_ok());
+
+    let id = insert_opportunity(&pool, &new).await.unwrap();
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.source_url.as_deref(),
+        Some("HTTPS://Example.org/Vacancy")
+    );
 }

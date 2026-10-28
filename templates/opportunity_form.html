@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+
+{% block title %}New opportunity — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>New opportunity</h1>
+  <p class="muted">Record a lead. Organization, title, stream, and stage are required; everything else is optional.</p>
+</header>
+
+{% match form_error %}
+{% when Some with (message) %}
+<p class="form-error">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+
+<form method="post" action="/opportunities" class="opportunity-form">
+  <div class="field">
+    <label for="organization">Organization</label>
+    <input id="organization" name="organization" type="text" value="{{ values.organization }}" maxlength="200">
+    {% match organization_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Organization {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="title">Title</label>
+    <input id="title" name="title" type="text" value="{{ values.title }}" maxlength="200">
+    {% match title_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Title {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="stream">Stream</label>
+    <input id="stream" name="stream" type="text" list="stream-options" value="{{ values.stream }}">
+    <datalist id="stream-options">
+      {% for stream in streams %}
+      <option value="{{ stream }}"></option>
+      {% endfor %}
+    </datalist>
+    <p class="hint">Pick a known stream or type a new label; new labels are remembered.</p>
+    {% match stream_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Stream {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field-row">
+    <div class="field">
+      <label for="city">City</label>
+      <input id="city" name="city" type="text" value="{{ values.city }}" maxlength="100">
+    </div>
+    <div class="field">
+      <label for="country">Country</label>
+      <input id="country" name="country" type="text" value="{{ values.country }}" maxlength="100">
+    </div>
+  </div>
+
+  <div class="field-row">
+    <div class="field">
+      <label for="priority">Priority</label>
+      <select id="priority" name="priority">
+        <option value="p1" {% if values.priority == "p1" %}selected{% endif %}>P1 — pursue seriously</option>
+        <option value="p2" {% if values.priority == "p2" %}selected{% endif %}>P2 — selective</option>
+        <option value="p3" {% if values.priority == "p3" %}selected{% endif %}>P3 — exploratory</option>
+      </select>
+      {% match priority_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Priority {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="field">
+      <label for="stage">Stage</label>
+      <select id="stage" name="stage">
+        <option value="discovered" {% if values.stage == "discovered" %}selected{% endif %}>Discovered</option>
+        <option value="researching" {% if values.stage == "researching" %}selected{% endif %}>Researching</option>
+        <option value="preparing" {% if values.stage == "preparing" %}selected{% endif %}>Preparing</option>
+        <option value="archived" {% if values.stage == "archived" %}selected{% endif %}>Archived</option>
+      </select>
+      {% match stage_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Stage {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="field">
+      <label for="deadline_date">Deadline (optional)</label>
+      <input id="deadline_date" name="deadline_date" type="date" value="{{ values.deadline_date }}">
+      {% match deadline_date_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Deadline {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="source_url">Source URL (optional)</label>
+    <input id="source_url" name="source_url" type="url" value="{{ values.source_url }}" maxlength="500" placeholder="https://">
+    {% match source_url_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Source URL {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="notes">Notes (optional)</label>
+    <textarea id="notes" name="notes" rows="4">{{ values.notes }}</textarea>
+  </div>
+
+  <button type="submit">Save opportunity</button>
+</form>
+{% endblock %}

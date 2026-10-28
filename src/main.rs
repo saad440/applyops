@@ -7,13 +7,12 @@
 
 mod db;
 
-use std::path::Path;
 use std::time::Instant;
 
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -74,6 +73,203 @@ struct IndexTemplate {
     notes: Vec<db::DiagnosticNote>,
 }
 
+/// View model of the opportunity create form: the entered values, the known
+/// stream labels for suggestions, and per-field validation errors.
+#[derive(Template)]
+#[template(path = "opportunity_form.html")]
+struct OpportunityFormTemplate {
+    streams: Vec<String>,
+    values: OpportunityFormValues,
+    organization_error: Option<String>,
+    title_error: Option<String>,
+    stream_error: Option<String>,
+    priority_error: Option<String>,
+    stage_error: Option<String>,
+    deadline_date_error: Option<String>,
+    source_url_error: Option<String>,
+    form_error: Option<String>,
+}
+
+/// The text values currently entered in the opportunity form, kept for
+/// redisplay when validation fails.
+#[derive(Default)]
+struct OpportunityFormValues {
+    organization: String,
+    title: String,
+    stream: String,
+    city: String,
+    country: String,
+    priority: String,
+    deadline_date: String,
+    source_url: String,
+    notes: String,
+    stage: String,
+}
+
+impl OpportunityFormTemplate {
+    /// An empty form with stream suggestions but no values or errors.
+    fn fresh(streams: Vec<String>) -> Self {
+        Self {
+            streams,
+            values: OpportunityFormValues::default(),
+            organization_error: None,
+            title_error: None,
+            stream_error: None,
+            priority_error: None,
+            stage_error: None,
+            deadline_date_error: None,
+            source_url_error: None,
+            form_error: None,
+        }
+    }
+}
+
+/// Rendered details of one stored opportunity. Display labels are prepared
+/// here so the template stays free of formatting logic.
+#[derive(Template)]
+#[template(path = "opportunity_details.html")]
+struct OpportunityDetailsTemplate {
+    title_heading: String,
+    external_url: Option<String>,
+    stream: String,
+    priority_label: String,
+    location_display: Option<String>,
+    deadline_display: String,
+    notes: Option<String>,
+    stage: String,
+    created_at: String,
+}
+
+impl OpportunityDetailsTemplate {
+    fn from_opportunity(opportunity: &db::opportunities::Opportunity) -> Self {
+        let location_display = match (&opportunity.city, &opportunity.country) {
+            (Some(city), Some(country)) => Some(format!("{city}, {country}")),
+            (Some(place), None) | (None, Some(place)) => Some(place.clone()),
+            (None, None) => None,
+        };
+
+        Self {
+            title_heading: format!("{} — {}", opportunity.organization, opportunity.title),
+            external_url: opportunity.source_url.clone(),
+            stream: opportunity.stream.clone(),
+            priority_label: opportunity.priority.to_uppercase(),
+            location_display,
+            deadline_display: opportunity
+                .deadline_date
+                .as_deref()
+                .map(format_date_human)
+                .unwrap_or_else(|| "No deadline recorded".to_string()),
+            notes: opportunity.notes.clone(),
+            stage: opportunity.stage.clone(),
+            created_at: opportunity.created_at.clone(),
+        }
+    }
+}
+
+/// Formats an ISO `YYYY-MM-DD` date as e.g. `15 Jan 2027` for display.
+/// Values that are not ten characters long are passed through unchanged.
+fn format_date_human(iso_date: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    if iso_date.len() != 10 {
+        return iso_date.to_string();
+    }
+
+    let year = &iso_date[0..4];
+    let day = iso_date[8..10].trim_start_matches('0');
+    let month: usize = iso_date[5..7].parse().unwrap_or(0);
+    match month {
+        1..=12 => format!("{day} {} {year}", MONTHS[month - 1]),
+        _ => iso_date.to_string(),
+    }
+}
+
+/// Raw text fields of a submitted opportunity form. Every value arrives as
+/// text and is trimmed; optional fields become `None` when left empty.
+struct OpportunityFormInput {
+    organization: String,
+    title: String,
+    stream: String,
+    city: String,
+    country: String,
+    priority: String,
+    deadline_date: String,
+    source_url: String,
+    notes: String,
+    stage: String,
+}
+
+impl OpportunityFormInput {
+    /// Collects the named fields from raw form pairs.
+    fn from_pairs(pairs: &[(String, String)]) -> Self {
+        fn field(pairs: &[(String, String)], name: &str) -> String {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.trim().to_string())
+                .unwrap_or_default()
+        }
+
+        Self {
+            organization: field(pairs, "organization"),
+            title: field(pairs, "title"),
+            stream: field(pairs, "stream"),
+            city: field(pairs, "city"),
+            country: field(pairs, "country"),
+            priority: field(pairs, "priority"),
+            deadline_date: field(pairs, "deadline_date"),
+            source_url: field(pairs, "source_url"),
+            notes: field(pairs, "notes"),
+            stage: field(pairs, "stage"),
+        }
+    }
+
+    /// Converts the submitted text into the validated data-layer input.
+    fn to_new_opportunity(&self, user_id: i64) -> db::opportunities::NewOpportunity {
+        fn optional(value: &str) -> Option<String> {
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        }
+
+        db::opportunities::NewOpportunity {
+            user_id,
+            organization: self.organization.clone(),
+            title: self.title.clone(),
+            stream: self.stream.clone(),
+            city: optional(&self.city),
+            country: optional(&self.country),
+            priority: self.priority.clone(),
+            deadline_date: optional(&self.deadline_date),
+            source_url: optional(&self.source_url),
+            notes: optional(&self.notes),
+            stage: self.stage.clone(),
+        }
+    }
+}
+
+/// Places a validation error on the form field it belongs to.
+fn apply_validation_error(
+    template: &mut OpportunityFormTemplate,
+    err: &db::opportunities::OpportunityValidationError,
+) {
+    let message = Some(err.reason.to_string());
+    match err.field {
+        "organization" => template.organization_error = message,
+        "title" => template.title_error = message,
+        "stream" => template.stream_error = message,
+        "priority" => template.priority_error = message,
+        "stage" => template.stage_error = message,
+        "deadline_date" => template.deadline_date_error = message,
+        "source_url" => template.source_url_error = message,
+        _ => template.form_error = Some(format!("{} {}", err.field, err.reason)),
+    }
+}
+
 /// Wraps an Askama template so it can be returned directly from handlers.
 struct HtmlTemplate<T>(T);
 
@@ -112,19 +308,28 @@ async fn main() {
     }
 
     let db_path = resolve_db_path(std::env::var(DB_PATH_ENV).ok());
-    if let Some(parent) = Path::new(&db_path).parent()
+    if let Some(parent) = std::path::Path::new(&db_path).parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .unwrap_or_else(|err| panic!("could not create data directory for {db_path}: {err}"));
     }
 
-    let pool = db::connect(Path::new(&db_path))
+    let pool = db::connect(std::path::Path::new(&db_path))
         .await
         .unwrap_or_else(|err| panic!("could not open database {db_path}: {err}"));
     db::run_migrations(&pool)
         .await
         .unwrap_or_else(|err| panic!("could not apply migrations: {err}"));
+
+    let seeded_streams =
+        db::streams::seed_streams_if_empty(&pool, DEFAULT_USER_ID, &db::streams::DEFAULT_STREAMS)
+            .await
+            .unwrap_or_else(|err| panic!("could not seed default streams: {err}"));
+    if seeded_streams > 0 {
+        tracing::info!(seeded_streams, "seeded default streams");
+    }
+
     tracing::info!(%db_path, "database ready");
 
     // Middleware applies to the routes registered before it.
@@ -132,6 +337,9 @@ async fn main() {
         .route("/", get(root))
         .route("/healthz", get(health))
         .route("/diagnostics/notes", post(create_note))
+        .route("/opportunities/new", get(new_opportunity_form))
+        .route("/opportunities", post(create_opportunity))
+        .route("/opportunities/{id}", get(opportunity_details))
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
         .layer(middleware::from_fn(log_requests));
@@ -190,6 +398,89 @@ async fn create_note(
     Redirect::to("/")
 }
 
+/// Loads the known stream labels for form suggestions, or an empty list when
+/// they cannot be read; the stream field stays usable as free text either way.
+async fn stream_suggestions(state: &AppState) -> Vec<String> {
+    match db::streams::list_streams(&state.db, DEFAULT_USER_ID).await {
+        Ok(streams) => streams.into_iter().map(|stream| stream.name).collect(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load stream labels");
+            Vec::new()
+        }
+    }
+}
+
+/// `GET /opportunities/new` — the empty opportunity create form.
+async fn new_opportunity_form(State(state): State<AppState>) -> Response {
+    let template = OpportunityFormTemplate::fresh(stream_suggestions(&state).await);
+    HtmlTemplate(template).into_response()
+}
+
+/// `POST /opportunities` — validates and stores a new opportunity, then
+/// redirects to its details page. Invalid input re-renders the form with the
+/// entered values and a field error.
+async fn create_opportunity(
+    State(state): State<AppState>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let input = OpportunityFormInput::from_pairs(&pairs);
+
+    let mut template = OpportunityFormTemplate::fresh(stream_suggestions(&state).await);
+    template.values = OpportunityFormValues {
+        organization: input.organization.clone(),
+        title: input.title.clone(),
+        stream: input.stream.clone(),
+        city: input.city.clone(),
+        country: input.country.clone(),
+        priority: input.priority.clone(),
+        deadline_date: input.deadline_date.clone(),
+        source_url: input.source_url.clone(),
+        notes: input.notes.clone(),
+        stage: input.stage.clone(),
+    };
+
+    match db::opportunities::insert_opportunity(
+        &state.db,
+        &input.to_new_opportunity(DEFAULT_USER_ID),
+    )
+    .await
+    {
+        Ok(id) => {
+            // Remember a newly used stream label so future forms offer it.
+            if let Err(err) =
+                db::streams::insert_stream(&state.db, DEFAULT_USER_ID, &input.stream).await
+            {
+                tracing::warn!(%err, "could not remember stream label");
+            }
+            Redirect::to(&format!("/opportunities/{id}")).into_response()
+        }
+        Err(db::opportunities::OpportunityInsertError::Validation(err)) => {
+            apply_validation_error(&mut template, &err);
+            HtmlTemplate(template).into_response()
+        }
+        Err(db::opportunities::OpportunityInsertError::Database(err)) => {
+            tracing::error!(%err, "failed to store opportunity");
+            template.form_error =
+                Some("The opportunity could not be stored. Please try again.".to_string());
+            HtmlTemplate(template).into_response()
+        }
+    }
+}
+
+/// `GET /opportunities/{id}` — details of one stored opportunity.
+async fn opportunity_details(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::opportunities::get_opportunity(&state.db, id).await {
+        Ok(Some(opportunity)) => {
+            HtmlTemplate(OpportunityDetailsTemplate::from_opportunity(&opportunity)).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such opportunity").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load opportunity");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
 /// `GET /healthz` — health check for scripted verification.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "OK: ApplyOps dev server")
@@ -214,113 +505,4 @@ async fn log_requests(req: Request, next: Next) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Application state over a fresh in-memory database with migrations run.
-    async fn test_state() -> AppState {
-        let pool = db::connect_in_memory().await.expect("in-memory pool");
-        db::run_migrations(&pool).await.expect("migrations run");
-        AppState { db: pool }
-    }
-
-    #[tokio::test]
-    async fn root_responds_with_html() {
-        let state = test_state().await;
-        let response = root(State(state)).await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&"text/html; charset=utf-8".parse().unwrap())
-        );
-    }
-
-    #[tokio::test]
-    async fn stored_note_appears_on_index_page() {
-        let state = test_state().await;
-        db::insert_note(&state.db, DEFAULT_USER_ID, "round trip")
-            .await
-            .unwrap();
-
-        let response = root(State(state)).await.into_response();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("round trip"));
-        assert!(body.contains("Persistent records"));
-    }
-
-    #[tokio::test]
-    async fn diagnostic_notes_round_trip() {
-        let pool = db::connect_in_memory().await.expect("in-memory pool");
-        db::run_migrations(&pool).await.expect("migrations run");
-        assert_eq!(db::count_notes(&pool).await.unwrap(), 0);
-
-        db::insert_note(&pool, DEFAULT_USER_ID, "smoke note")
-            .await
-            .unwrap();
-
-        let notes = db::recent_notes(&pool, 10).await.unwrap();
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].note, "smoke note");
-        assert_eq!(notes[0].user_id, DEFAULT_USER_ID);
-        assert_eq!(db::count_notes(&pool).await.unwrap(), 1);
-    }
-
-    #[test]
-    fn index_template_links_stylesheet() {
-        let template = IndexTemplate {
-            note_count: 0,
-            notes: Vec::new(),
-        };
-        let html = template.render().expect("index template renders");
-        assert!(html.contains(r#"href="/static/css/app.css""#));
-        assert!(html.contains("ApplyOps"));
-    }
-
-    #[tokio::test]
-    async fn health_responds_with_ok() {
-        let response = health().await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn bind_addr_defaults_to_loopback() {
-        assert_eq!(resolve_bind_addr(None), "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn bind_addr_env_overrides_default() {
-        assert_eq!(
-            resolve_bind_addr(Some("0.0.0.0:9000".to_string())),
-            "0.0.0.0:9000"
-        );
-    }
-
-    #[test]
-    fn db_path_defaults_to_data_dir() {
-        assert_eq!(resolve_db_path(None), "data/applyops.db");
-    }
-
-    #[test]
-    fn db_path_env_overrides_default() {
-        assert_eq!(
-            resolve_db_path(Some("/tmp/other.db".to_string())),
-            "/tmp/other.db"
-        );
-    }
-
-    #[test]
-    fn loopback_addresses_are_detected() {
-        assert!(is_loopback_addr("127.0.0.1:8080"));
-        assert!(is_loopback_addr("localhost:8080"));
-        assert!(is_loopback_addr("[::1]:9000"));
-    }
-
-    #[test]
-    fn non_loopback_addresses_are_detected() {
-        assert!(!is_loopback_addr("0.0.0.0:8080"));
-        assert!(!is_loopback_addr("192.168.1.10:8080"));
-    }
-}
+mod tests;

@@ -90,17 +90,10 @@ pub async fn count_notes(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     Ok(count)
 }
 
-/// Opportunity persistence: data model, vocabularies, and queries. The
-/// opportunity pages call into this module; until they exist the data-layer
-/// tests are its only callers, hence the temporary `dead_code` allowance.
-#[allow(dead_code)]
+/// Opportunity persistence: data model, vocabularies, and queries for the
+/// `opportunities` table.
 pub mod opportunities {
     use super::*;
-
-    /// Stream labels shipped as defaults for the stream picker. Streams are
-    /// user-defined labels and are stored verbatim; these values only
-    /// suggest a starting vocabulary and are never enforced.
-    pub const DEFAULT_STREAMS: [&str; 3] = ["Physics", "Scientific Computing", "IT"];
 
     /// Opportunity stages of the discovery workflow.
     pub const STAGES: [&str; 4] = ["discovered", "researching", "preparing", "archived"];
@@ -114,7 +107,12 @@ pub mod opportunities {
     /// A stored opportunity as read from the `opportunities` table.
     #[derive(Debug)]
     pub struct Opportunity {
+        /// Not displayed anywhere yet; links and the edit page will use it.
+        #[allow(dead_code)]
         pub id: i64,
+        /// Not displayed anywhere yet; kept so user-scoped queries stay
+        /// possible without schema work. Read by the data-layer tests.
+        #[allow(dead_code)]
         pub user_id: i64,
         pub organization: String,
         pub title: String,
@@ -214,11 +212,25 @@ pub mod opportunities {
         (1..=12).contains(&month) && (1..=31).contains(&day)
     }
 
+    /// Checks that a value looks like a web address: an `http` or `https`
+    /// scheme followed by something beyond the scheme itself. The rest of
+    /// the address is not parsed further.
+    fn is_http_url(value: &str) -> bool {
+        let lowercase = value.to_lowercase();
+        for scheme in ["http://", "https://"] {
+            if let Some(rest) = lowercase.strip_prefix(scheme) {
+                return !rest.is_empty();
+            }
+        }
+        false
+    }
+
     /// Validates user-supplied opportunity data. Required text must be
     /// non-empty after trimming; the stream is a user-defined label and is
     /// only checked for emptiness, while priority and stage are validated
-    /// against their generic vocabularies. Optional fields stay optional and
-    /// a missing deadline is `None`, never a placeholder date.
+    /// against their generic vocabularies. Optional fields stay optional, a
+    /// missing deadline is `None` never a placeholder date, and a recorded
+    /// source URL must be an http or https web address.
     pub fn validate_new_opportunity(
         new: &NewOpportunity,
     ) -> Result<(), OpportunityValidationError> {
@@ -266,6 +278,15 @@ pub mod opportunities {
             return Err(OpportunityValidationError {
                 field: "deadline_date",
                 reason: "must be a calendar date formatted YYYY-MM-DD",
+            });
+        }
+
+        if let Some(url) = &new.source_url
+            && !is_http_url(url)
+        {
+            return Err(OpportunityValidationError {
+                field: "source_url",
+                reason: "must be an http or https web address",
             });
         }
 
@@ -343,6 +364,9 @@ pub mod opportunities {
     }
 
     /// Lists opportunities newest first, up to `limit` rows.
+    // The opportunity list page arrives in a later slice; until then only
+    // the data-layer tests call this.
+    #[allow(dead_code)]
     pub async fn list_opportunities(
         pool: &SqlitePool,
         limit: i64,
@@ -360,11 +384,120 @@ pub mod opportunities {
     }
 
     /// Returns the total number of stored opportunities.
+    // The opportunity list page arrives in a later slice; until then only
+    // the data-layer tests call this.
+    #[allow(dead_code)]
     pub async fn count_opportunities(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
             .fetch_one(pool)
             .await?;
         Ok(count)
+    }
+}
+
+/// User-defined stream vocabulary. Streams are plain labels the user creates;
+/// this table remembers them so forms can offer the known ones back, and the
+/// shipped defaults seed a fresh installation only while the table is empty.
+pub mod streams {
+    use super::*;
+
+    /// Stream labels shipped as defaults for a fresh installation. They are
+    /// bootstrap suggestions only and are never enforced.
+    pub const DEFAULT_STREAMS: [&str; 3] = ["Physics", "Scientific Computing", "IT"];
+
+    /// A stored stream label as read from the `streams` table.
+    #[derive(Debug)]
+    pub struct Stream {
+        /// Not displayed anywhere yet; read by the data-layer tests.
+        #[allow(dead_code)]
+        pub id: i64,
+        /// Not displayed anywhere yet; kept so user-scoped queries stay
+        /// possible without schema work.
+        #[allow(dead_code)]
+        pub user_id: i64,
+        pub name: String,
+        /// Not displayed anywhere yet; read by the data-layer tests.
+        #[allow(dead_code)]
+        pub created_at: String,
+    }
+
+    /// Maps one `streams` row into a [`Stream`].
+    fn stream_from_row(row: &SqliteRow) -> Result<Stream, sqlx::Error> {
+        Ok(Stream {
+            id: row.try_get("id")?,
+            user_id: row.try_get("user_id")?,
+            name: row.try_get("name")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    /// Lists the known stream labels of a user, alphabetical and
+    /// case-insensitive.
+    pub async fn list_streams(pool: &SqlitePool, user_id: i64) -> Result<Vec<Stream>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, name, created_at \
+             FROM streams WHERE user_id = ? ORDER BY name COLLATE NOCASE",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        rows.iter().map(stream_from_row).collect()
+    }
+
+    /// Stores a stream label and returns its id. An identical label that
+    /// already exists for the user is left untouched and its id returned.
+    pub async fn insert_stream(
+        pool: &SqlitePool,
+        user_id: i64,
+        name: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let name = name.trim();
+        if let Some(id) = stream_id(pool, user_id, name).await? {
+            return Ok(id);
+        }
+
+        sqlx::query_scalar("INSERT INTO streams (user_id, name) VALUES (?, ?) RETURNING id")
+            .bind(user_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+    }
+
+    /// Returns the id of an existing stream label, if present.
+    async fn stream_id(
+        pool: &SqlitePool,
+        user_id: i64,
+        name: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM streams WHERE user_id = ? AND name = ?")
+            .bind(user_id)
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+    }
+
+    /// Seeds the shipped default streams while the user has none, returning
+    /// how many rows were inserted.
+    pub async fn seed_streams_if_empty(
+        pool: &SqlitePool,
+        user_id: i64,
+        defaults: &[&str],
+    ) -> Result<usize, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM streams WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+        if count > 0 {
+            return Ok(0);
+        }
+
+        let mut inserted = 0;
+        for name in defaults {
+            insert_stream(pool, user_id, name).await?;
+            inserted += 1;
+        }
+        Ok(inserted)
     }
 }
 

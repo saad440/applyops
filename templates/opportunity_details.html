@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title_heading }} — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>{{ title_heading }}</h1>
+  <p class="muted">{{ stream }} · {{ priority_label }} · {{ stage }}</p>
+</header>
+
+<section class="card">
+  <dl class="details">
+    <dt>Deadline</dt>
+    <dd>{{ deadline_display }}</dd>
+
+    {% match location_display %}
+    {% when Some with (place) %}
+    <dt>Location</dt>
+    <dd>{{ place }}</dd>
+    {% when None %}
+    {% endmatch %}
+
+    {% match external_url %}
+    {% when Some with (url) %}
+    <dt>Source</dt>
+    <dd><a href="{{ url }}" rel="noopener noreferrer">{{ url }}</a></dd>
+    {% when None %}
+    {% endmatch %}
+
+    <dt>Recorded</dt>
+    <dd>{{ created_at }}</dd>
+  </dl>
+
+  {% match notes %}
+  {% when Some with (text) %}
+  <h2>Notes</h2>
+  <p class="notes">{{ text }}</p>
+  {% when None %}
+  {% endmatch %}
+</section>
+
+<p><a href="/opportunities/new">Add another opportunity</a></p>
+{% endblock %}

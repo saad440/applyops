@@ -12,6 +12,7 @@
   --color-muted: #6d6d66;
   --color-accent: #2c5f8a;
   --color-border: #dcdcd5;
+  --color-error: #a13a40;
 
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -37,6 +38,7 @@
     --color-muted: #a3a39b;
     --color-accent: #7fb0d8;
     --color-border: #3a3a36;
+    --color-error: #e08084;
   }
 }
 
@@ -148,4 +150,96 @@ a {
 
 .note-list li {
   margin-bottom: var(--space-1);
+}
+
+/* Opportunity create form. */
+.opportunity-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+}
+
+.opportunity-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.opportunity-form .field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.opportunity-form .field-row .field {
+  flex: 1;
+  min-width: 10rem;
+}
+
+.opportunity-form label {
+  font-size: 0.9rem;
+  color: var(--color-muted);
+}
+
+.opportunity-form input,
+.opportunity-form select,
+.opportunity-form textarea {
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+  max-width: 100%;
+}
+
+.opportunity-form button {
+  align-self: flex-start;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-accent);
+  color: var(--color-bg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.field-error {
+  margin: 0;
+  color: var(--color-error);
+  font-size: 0.875rem;
+}
+
+.form-error {
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+}
+
+.hint {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+/* Opportunity details. */
+.details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+.details dt {
+  color: var(--color-muted);
+}
+
+.details dd {
+  margin: 0;
+}
+
+.notes {
+  white-space: pre-wrap;
+  margin: 0;
 }
