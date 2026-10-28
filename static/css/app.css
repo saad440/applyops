@@ -243,3 +243,60 @@ a {
   white-space: pre-wrap;
   margin: 0;
 }
+
+/* Opportunity list and search. */
+.search-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  margin: var(--space-3) 0;
+}
+
+.search-form label {
+  font-size: 0.9rem;
+  color: var(--color-muted);
+}
+
+.search-form input {
+  flex: 1;
+  min-width: 12rem;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.search-form button {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-accent);
+  color: var(--color-bg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.opportunity-list {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.opportunity-list h2 {
+  margin: 0 0 var(--space-1);
+  font-size: 1.1rem;
+}
+
+.opportunity-list p {
+  margin: 0 0 var(--space-1);
+}
+
+.footer-links {
+  margin-top: var(--space-4);
+}

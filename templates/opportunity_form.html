@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 
-{% block title %}New opportunity — ApplyOps{% endblock %}
+{% block title %}{{ form_heading }} — ApplyOps{% endblock %}
 
 {% block content %}
 <header class="page-header">
-  <h1>New opportunity</h1>
-  <p class="muted">Record a lead. Organization, title, stream, and stage are required; everything else is optional.</p>
+  <h1>{{ form_heading }}</h1>
+  <p class="muted">Organization, title, stream, and stage are required; everything else is optional.</p>
 </header>
 
 {% match form_error %}
@@ -14,7 +14,7 @@
 {% when None %}
 {% endmatch %}
 
-<form method="post" action="/opportunities" class="opportunity-form">
+<form method="post" action="{{ form_action }}" class="opportunity-form">
   <div class="field">
     <label for="organization">Organization</label>
     <input id="organization" name="organization" type="text" value="{{ values.organization }}" maxlength="200">
@@ -116,6 +116,6 @@
     <textarea id="notes" name="notes" rows="4">{{ values.notes }}</textarea>
   </div>
 
-  <button type="submit">Save opportunity</button>
+  <button type="submit">{{ submit_label }}</button>
 </form>
 {% endblock %}

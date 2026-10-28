@@ -107,8 +107,6 @@ pub mod opportunities {
     /// A stored opportunity as read from the `opportunities` table.
     #[derive(Debug)]
     pub struct Opportunity {
-        /// Not displayed anywhere yet; links and the edit page will use it.
-        #[allow(dead_code)]
         pub id: i64,
         /// Not displayed anywhere yet; kept so user-scoped queries stay
         /// possible without schema work. Read by the data-layer tests.
@@ -364,9 +362,6 @@ pub mod opportunities {
     }
 
     /// Lists opportunities newest first, up to `limit` rows.
-    // The opportunity list page arrives in a later slice; until then only
-    // the data-layer tests call this.
-    #[allow(dead_code)]
     pub async fn list_opportunities(
         pool: &SqlitePool,
         limit: i64,
@@ -383,9 +378,83 @@ pub mod opportunities {
         rows.iter().map(opportunity_from_row).collect()
     }
 
+    /// Escapes SQL LIKE wildcards in user-supplied search text so a search
+    /// for a literal `%` or `_` matches itself, not any character.
+    fn escape_like(text: &str) -> String {
+        text.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    }
+
+    /// Lists opportunities whose organization, title, notes, or stream
+    /// contain the search text, case-insensitively for ASCII letters,
+    /// newest first.
+    pub async fn search_opportunities(
+        pool: &SqlitePool,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<Opportunity>, sqlx::Error> {
+        let pattern = format!("%{}%", escape_like(query.trim()));
+        let rows = sqlx::query(
+            "SELECT id, user_id, organization, title, stream, city, country, priority, \
+             deadline_date, source_url, notes, stage, created_at \
+             FROM opportunities \
+             WHERE organization LIKE ?1 ESCAPE '\\' \
+                OR title LIKE ?1 ESCAPE '\\' \
+                OR notes LIKE ?1 ESCAPE '\\' \
+                OR stream LIKE ?1 ESCAPE '\\' \
+             ORDER BY created_at DESC, id DESC LIMIT ?2",
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        rows.iter().map(opportunity_from_row).collect()
+    }
+
+    /// Updates an opportunity with new values and returns its id, or `None`
+    /// when no row with that id exists. Input is validated first, so
+    /// invalid priority or stage values never reach SQL.
+    pub async fn update_opportunity(
+        pool: &SqlitePool,
+        id: i64,
+        new: &NewOpportunity,
+    ) -> Result<Option<i64>, OpportunityInsertError> {
+        validate_new_opportunity(new).map_err(OpportunityInsertError::Validation)?;
+
+        let result = sqlx::query(
+            "UPDATE opportunities \
+             SET user_id = ?, organization = ?, title = ?, stream = ?, city = ?, \
+                 country = ?, priority = ?, deadline_date = ?, source_url = ?, \
+                 notes = ?, stage = ? \
+             WHERE id = ?",
+        )
+        .bind(new.user_id)
+        .bind(new.organization.trim())
+        .bind(new.title.trim())
+        .bind(new.stream.trim())
+        .bind(&new.city)
+        .bind(&new.country)
+        .bind(&new.priority)
+        .bind(&new.deadline_date)
+        .bind(&new.source_url)
+        .bind(&new.notes)
+        .bind(&new.stage)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(OpportunityInsertError::Database)?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(id))
+    }
+
     /// Returns the total number of stored opportunities.
-    // The opportunity list page arrives in a later slice; until then only
-    // the data-layer tests call this.
+    // Used as an assertion helper by the tests for now.
+    // The dashboard counts will call it once the overview lands.
     #[allow(dead_code)]
     pub async fn count_opportunities(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")

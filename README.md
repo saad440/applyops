@@ -17,6 +17,20 @@ Then open <http://127.0.0.1:8080>.
 
 On first start the application creates an SQLite database at `data/applyops.db` and applies the SQL migrations from `migrations/`.
 
+## Usage
+
+1. Pick **Add an opportunity** to record a lead. Organization, title, stream,
+   and stage are required; deadline, location, link, and notes are optional
+   and only stored when you enter them.
+2. The home page lists all opportunities, newest first. The search box
+   filters by organization, title, notes, or stream.
+3. Open a lead to see its details and use **Edit** to update it — for example
+   to move it along its stages: `discovered` → `researching` → `preparing`,
+   and `archived` once you stop pursuing it. Archived leads stay listed and
+   remain editable.
+4. Streams are free-form labels: the form suggests a few built-in defaults
+   and remembers every new label you use.
+
 ## Configuration
 
 Configuration is read from environment variables with safe local defaults:

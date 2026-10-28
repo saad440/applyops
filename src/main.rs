@@ -12,7 +12,7 @@ use std::time::Instant;
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -65,19 +65,33 @@ struct AppState {
     db: SqlitePool,
 }
 
-/// Index page, rendered from `templates/index.html` at compile time.
+/// Index page: the opportunity list, optionally filtered by a search term,
+/// rendered from `templates/index.html` at compile time.
 #[derive(Template)]
 #[template(path = "index.html")]
-struct IndexTemplate {
+struct OpportunityListTemplate {
+    search_query: String,
+    opportunities: Vec<db::opportunities::Opportunity>,
+    list_count: i64,
+}
+
+/// Diagnostics page, rendered from `templates/diagnostics.html` at compile time.
+#[derive(Template)]
+#[template(path = "diagnostics.html")]
+struct DiagnosticsTemplate {
     note_count: i64,
     notes: Vec<db::DiagnosticNote>,
 }
 
-/// View model of the opportunity create form: the entered values, the known
-/// stream labels for suggestions, and per-field validation errors.
+/// View model of the opportunity form, used for both creating and editing:
+/// the entered values, the known stream labels for suggestions, and
+/// per-field validation errors.
 #[derive(Template)]
 #[template(path = "opportunity_form.html")]
 struct OpportunityFormTemplate {
+    form_heading: String,
+    form_action: String,
+    submit_label: String,
     streams: Vec<String>,
     values: OpportunityFormValues,
     organization_error: Option<String>,
@@ -108,8 +122,16 @@ struct OpportunityFormValues {
 
 impl OpportunityFormTemplate {
     /// An empty form with stream suggestions but no values or errors.
-    fn fresh(streams: Vec<String>) -> Self {
+    fn fresh(
+        form_heading: String,
+        form_action: String,
+        submit_label: String,
+        streams: Vec<String>,
+    ) -> Self {
         Self {
+            form_heading,
+            form_action,
+            submit_label,
             streams,
             values: OpportunityFormValues::default(),
             organization_error: None,
@@ -129,6 +151,7 @@ impl OpportunityFormTemplate {
 #[derive(Template)]
 #[template(path = "opportunity_details.html")]
 struct OpportunityDetailsTemplate {
+    opportunity_id: i64,
     title_heading: String,
     external_url: Option<String>,
     stream: String,
@@ -149,6 +172,7 @@ impl OpportunityDetailsTemplate {
         };
 
         Self {
+            opportunity_id: opportunity.id,
             title_heading: format!("{} — {}", opportunity.organization, opportunity.title),
             external_url: opportunity.source_url.clone(),
             stream: opportunity.stream.clone(),
@@ -252,6 +276,42 @@ impl OpportunityFormInput {
     }
 }
 
+/// Fills the redisplay values of a form from submitted input.
+fn fill_form_values(template: &mut OpportunityFormTemplate, input: &OpportunityFormInput) {
+    template.values = OpportunityFormValues {
+        organization: input.organization.clone(),
+        title: input.title.clone(),
+        stream: input.stream.clone(),
+        city: input.city.clone(),
+        country: input.country.clone(),
+        priority: input.priority.clone(),
+        deadline_date: input.deadline_date.clone(),
+        source_url: input.source_url.clone(),
+        notes: input.notes.clone(),
+        stage: input.stage.clone(),
+    };
+}
+
+/// Converts a stored opportunity into redisplay values for the edit form.
+fn form_values_from(opportunity: &db::opportunities::Opportunity) -> OpportunityFormValues {
+    fn text(value: &Option<String>) -> String {
+        value.as_deref().unwrap_or_default().to_string()
+    }
+
+    OpportunityFormValues {
+        organization: opportunity.organization.clone(),
+        title: opportunity.title.clone(),
+        stream: opportunity.stream.clone(),
+        city: text(&opportunity.city),
+        country: text(&opportunity.country),
+        priority: opportunity.priority.clone(),
+        deadline_date: text(&opportunity.deadline_date),
+        source_url: text(&opportunity.source_url),
+        notes: text(&opportunity.notes),
+        stage: opportunity.stage.clone(),
+    }
+}
+
 /// Places a validation error on the form field it belongs to.
 fn apply_validation_error(
     template: &mut OpportunityFormTemplate,
@@ -336,10 +396,15 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/healthz", get(health))
+        .route("/diagnostics", get(diagnostics))
         .route("/diagnostics/notes", post(create_note))
         .route("/opportunities/new", get(new_opportunity_form))
         .route("/opportunities", post(create_opportunity))
         .route("/opportunities/{id}", get(opportunity_details))
+        .route(
+            "/opportunities/{id}/edit",
+            get(edit_opportunity_form).post(update_opportunity),
+        )
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
         .layer(middleware::from_fn(log_requests));
@@ -353,8 +418,41 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
-/// `GET /` — index page with the current diagnostic records.
-async fn root(State(state): State<AppState>) -> impl IntoResponse {
+/// `GET /` — the opportunity list, optionally filtered by `?q=`.
+async fn root(
+    State(state): State<AppState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let search_query = pairs
+        .iter()
+        .find(|(key, _)| key == "q")
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default();
+
+    let opportunities = if search_query.is_empty() {
+        db::opportunities::list_opportunities(&state.db, 100).await
+    } else {
+        db::opportunities::search_opportunities(&state.db, &search_query, 100).await
+    };
+
+    let opportunities = match opportunities {
+        Ok(opportunities) => opportunities,
+        Err(err) => {
+            tracing::error!(%err, "failed to load opportunities");
+            Vec::new()
+        }
+    };
+
+    HtmlTemplate(OpportunityListTemplate {
+        list_count: opportunities.len() as i64,
+        search_query,
+        opportunities,
+    })
+    .into_response()
+}
+
+/// `GET /diagnostics` — the persistence smoke-test notes page.
+async fn diagnostics(State(state): State<AppState>) -> Response {
     let count = match db::count_notes(&state.db).await {
         Ok(count) => count,
         Err(err) => {
@@ -371,14 +469,15 @@ async fn root(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    HtmlTemplate(IndexTemplate {
+    HtmlTemplate(DiagnosticsTemplate {
         note_count: count,
         notes,
     })
+    .into_response()
 }
 
 /// `POST /diagnostics/notes` — stores a diagnostic note, then redirects back
-/// to the index page.
+/// to the diagnostics page.
 async fn create_note(
     State(state): State<AppState>,
     Form(form): Form<Vec<(String, String)>>,
@@ -395,7 +494,7 @@ async fn create_note(
         tracing::error!(%err, "failed to store diagnostic note");
     }
 
-    Redirect::to("/")
+    Redirect::to("/diagnostics")
 }
 
 /// Loads the known stream labels for form suggestions, or an empty list when
@@ -412,7 +511,12 @@ async fn stream_suggestions(state: &AppState) -> Vec<String> {
 
 /// `GET /opportunities/new` — the empty opportunity create form.
 async fn new_opportunity_form(State(state): State<AppState>) -> Response {
-    let template = OpportunityFormTemplate::fresh(stream_suggestions(&state).await);
+    let template = OpportunityFormTemplate::fresh(
+        "New opportunity".to_string(),
+        "/opportunities".to_string(),
+        "Save opportunity".to_string(),
+        stream_suggestions(&state).await,
+    );
     HtmlTemplate(template).into_response()
 }
 
@@ -425,19 +529,13 @@ async fn create_opportunity(
 ) -> Response {
     let input = OpportunityFormInput::from_pairs(&pairs);
 
-    let mut template = OpportunityFormTemplate::fresh(stream_suggestions(&state).await);
-    template.values = OpportunityFormValues {
-        organization: input.organization.clone(),
-        title: input.title.clone(),
-        stream: input.stream.clone(),
-        city: input.city.clone(),
-        country: input.country.clone(),
-        priority: input.priority.clone(),
-        deadline_date: input.deadline_date.clone(),
-        source_url: input.source_url.clone(),
-        notes: input.notes.clone(),
-        stage: input.stage.clone(),
-    };
+    let mut template = OpportunityFormTemplate::fresh(
+        "New opportunity".to_string(),
+        "/opportunities".to_string(),
+        "Save opportunity".to_string(),
+        stream_suggestions(&state).await,
+    );
+    fill_form_values(&mut template, &input);
 
     match db::opportunities::insert_opportunity(
         &state.db,
@@ -477,6 +575,68 @@ async fn opportunity_details(State(state): State<AppState>, Path(id): Path<i64>)
         Err(err) => {
             tracing::error!(%err, "failed to load opportunity");
             (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `GET /opportunities/{id}/edit` — the edit form pre-filled with the stored
+/// values.
+async fn edit_opportunity_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::opportunities::get_opportunity(&state.db, id).await {
+        Ok(Some(opportunity)) => {
+            let mut template = OpportunityFormTemplate::fresh(
+                "Edit opportunity".to_string(),
+                format!("/opportunities/{id}/edit"),
+                "Save changes".to_string(),
+                stream_suggestions(&state).await,
+            );
+            template.values = form_values_from(&opportunity);
+            HtmlTemplate(template).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such opportunity").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load opportunity");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `POST /opportunities/{id}/edit` — validates and stores changes, then
+/// redirects to the details page. Invalid input re-renders the edit form
+/// with the entered values and a field error.
+async fn update_opportunity(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let input = OpportunityFormInput::from_pairs(&pairs);
+
+    let mut template = OpportunityFormTemplate::fresh(
+        "Edit opportunity".to_string(),
+        format!("/opportunities/{id}/edit"),
+        "Save changes".to_string(),
+        stream_suggestions(&state).await,
+    );
+    fill_form_values(&mut template, &input);
+
+    match db::opportunities::update_opportunity(
+        &state.db,
+        id,
+        &input.to_new_opportunity(DEFAULT_USER_ID),
+    )
+    .await
+    {
+        Ok(Some(_)) => Redirect::to(&format!("/opportunities/{id}")).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "No such opportunity").into_response(),
+        Err(db::opportunities::OpportunityInsertError::Validation(err)) => {
+            apply_validation_error(&mut template, &err);
+            HtmlTemplate(template).into_response()
+        }
+        Err(db::opportunities::OpportunityInsertError::Database(err)) => {
+            tracing::error!(%err, "failed to update opportunity");
+            template.form_error =
+                Some("The opportunity could not be stored. Please try again.".to_string());
+            HtmlTemplate(template).into_response()
         }
     }
 }

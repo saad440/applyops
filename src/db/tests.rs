@@ -312,3 +312,89 @@ async fn source_urls_must_be_web_addresses() {
         Some("HTTPS://Example.org/Vacancy")
     );
 }
+
+#[tokio::test]
+async fn update_changes_stored_values() {
+    let pool = migrated_pool().await;
+    let id = insert_opportunity(&pool, &sample_opportunity())
+        .await
+        .unwrap();
+
+    let mut edited = sample_opportunity();
+    edited.title = "PhD position, cryogenic detectors".to_string();
+    edited.stage = "researching".to_string();
+    edited.deadline_date = None;
+    update_opportunity(&pool, id, &edited)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert_eq!(stored.title, "PhD position, cryogenic detectors");
+    assert_eq!(stored.stage, "researching");
+    assert!(stored.deadline_date.is_none());
+    assert_eq!(stored.organization, "Universität Schneckenhausen");
+}
+
+#[tokio::test]
+async fn update_missing_row_returns_none() {
+    let pool = migrated_pool().await;
+    let result = update_opportunity(&pool, 999, &sample_opportunity())
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn update_rejects_invalid_values_without_touching_the_row() {
+    let pool = migrated_pool().await;
+    let id = insert_opportunity(&pool, &sample_opportunity())
+        .await
+        .unwrap();
+
+    let mut edited = sample_opportunity();
+    edited.stage = "applied".to_string();
+    let err = update_opportunity(&pool, id, &edited).await.unwrap_err();
+    assert!(matches!(err, OpportunityInsertError::Validation(_)));
+
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert_eq!(stored.stage, "discovered");
+}
+
+#[tokio::test]
+async fn search_matches_fields_and_escapes_wildcards() {
+    let pool = migrated_pool().await;
+
+    let mut university = sample_opportunity();
+    university.notes = Some("Fond of literals like a_b and 100%".to_string());
+    insert_opportunity(&pool, &university).await.unwrap();
+
+    insert_opportunity(&pool, &sample_it_opportunity())
+        .await
+        .unwrap();
+
+    // Matches by organization substring, newest first.
+    let hits = search_opportunities(&pool, "Buzzworks", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].organization, "SynerTech Buzzworks GmbH");
+
+    // Matches by title.
+    let hits = search_opportunities(&pool, "low-temperature", 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // Wildcards in the query are literals, not patterns.
+    let hits = search_opportunities(&pool, "a_b", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let hits = search_opportunities(&pool, "100%", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // ASCII case-insensitivity.
+    let hits = search_opportunities(&pool, "buzzworks", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // No match yields an empty list.
+    let hits = search_opportunities(&pool, "quantum", 10).await.unwrap();
+    assert!(hits.is_empty());
+}

@@ -1,32 +1,47 @@
 {% extends "base.html" %}
 
+{% block title %}ApplyOps{% endblock %}
+
 {% block content %}
 <header class="page-header">
   <h1>ApplyOps</h1>
-  <p class="muted">Local opportunity and application tracker</p>
-  <p><a href="/opportunities/new">Add an opportunity</a></p>
+  <p class="muted">Opportunity list · {{ list_count }} shown</p>
 </header>
+
+<form method="get" action="/" class="search-form">
+  <label for="q">Search</label>
+  <input id="q" name="q" type="search" value="{{ search_query }}">
+  <button type="submit">Search</button>
+  {% if !search_query.is_empty() %}
+  <a href="/">Clear</a>
+  {% endif %}
+</form>
+
+{% if opportunities.is_empty() %}
 <section class="card">
-  <h2>Diagnostics</h2>
-  <p>
-    This page is rendered on the server by Askama and styled by the local
-    stylesheet at <code>/static/css/app.css</code>. Records below are stored
-    in SQLite and survive application restarts.
-  </p>
-  <p>Persistent records: <strong>{{ note_count }}</strong></p>
-  <form method="post" action="/diagnostics/notes" class="note-form">
-    <label for="note">Diagnostic note</label>
-    <input id="note" name="note" type="text" required maxlength="200">
-    <button type="submit">Add</button>
-  </form>
-  {% if notes.is_empty() %}
-  <p class="muted">No notes stored yet.</p>
+  {% if search_query.is_empty() %}
+  <p>No opportunities recorded yet.</p>
+  <p><a href="/opportunities/new">Add the first opportunity</a> to get started.</p>
   {% else %}
-  <ul class="note-list">
-    {% for entry in notes %}
-    <li><code>{{ entry.created_at }}</code> — {{ entry.note }}</li>
-    {% endfor %}
-  </ul>
+  <p>Nothing matches “{{ search_query }}”.</p>
+  <p><a href="/">Show all opportunities</a>.</p>
   {% endif %}
 </section>
+{% else %}
+<ul class="opportunity-list">
+  {% for opportunity in opportunities %}
+  <li class="card">
+    <h2><a href="/opportunities/{{ opportunity.id }}">{{ opportunity.organization }} — {{ opportunity.title }}</a></h2>
+    <p class="muted">{{ opportunity.stream }} · {{ opportunity.priority }} · {{ opportunity.stage }}</p>
+    {% match opportunity.deadline_date %}
+    {% when Some with (date) %}
+    <p>Deadline: {{ date }}</p>
+    {% when None %}
+    {% endmatch %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<p class="footer-links"><a href="/opportunities/new">Add an opportunity</a> · <a href="/diagnostics">Diagnostics</a></p>
 {% endblock %}
