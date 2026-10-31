@@ -499,7 +499,7 @@ async fn only_one_active_attempt_per_opportunity() {
 }
 
 #[tokio::test]
-async fn in_progress_transitions_follow_d017() {
+async fn in_progress_transitions_only_move_between_draft_and_preparing() {
     let pool = migrated_pool().await;
     let opportunity_id = opportunity_id(&pool).await;
     let id = applications::insert_application(&pool, USER_ID, opportunity_id)
@@ -950,4 +950,519 @@ async fn missing_application_outcome_reports_application_missing() {
         applications::record_employer_outcome(&pool, 999, "offer", Some("2026-10-25")).await,
         Err(applications::OutcomeError::ApplicationMissing)
     ));
+}
+
+// --- Reporting obligations and known authorities ---
+
+use super::authorities;
+use super::obligations;
+
+/// Inserts the sample opportunity and a submitted application attempt,
+/// returning the opportunity and application ids.
+async fn submitted_attempt(pool: &SqlitePool) -> (i64, i64) {
+    let opportunity_id = opportunity_id(pool).await;
+    let id = applications::insert_application(pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    (opportunity_id, id)
+}
+
+/// Report input with everything optional left empty.
+fn report(
+    status: &'static str,
+    reported_at: Option<&'static str>,
+) -> obligations::NewReport<'static> {
+    obligations::NewReport {
+        status,
+        reported_at,
+        method: None,
+        reference: None,
+        recipient_name: None,
+        notes: None,
+    }
+}
+
+#[tokio::test]
+async fn report_saves_update_one_row_per_kind() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+
+    let stored = obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.user_id, USER_ID);
+    assert_eq!(stored.application_id, id);
+    assert_eq!(stored.kind, obligations::DEFAULT_KIND);
+    assert_eq!(stored.status, "pending");
+    assert!(stored.reported_at.is_none());
+
+    // A correction updates the same row rather than adding one.
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &obligations::NewReport {
+            status: "reported",
+            reported_at: Some("2026-11-02"),
+            method: Some("portal"),
+            reference: Some("AB-123"),
+            recipient_name: Some("District Office Musterstadt"),
+            notes: Some("confirmed online"),
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored = obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "reported");
+    assert_eq!(stored.reported_at.as_deref(), Some("2026-11-02"));
+    assert_eq!(stored.method.as_deref(), Some("portal"));
+    assert_eq!(stored.reference.as_deref(), Some("AB-123"));
+    assert_eq!(
+        stored.recipient_name.as_deref(),
+        Some("District Office Musterstadt")
+    );
+    assert_eq!(stored.notes.as_deref(), Some("confirmed online"));
+
+    // Only one row may exist per application and kind.
+    let err = sqlx::query(
+        "INSERT INTO reporting_obligations (user_id, application_id, kind) \
+         VALUES (?, ?, 'employment_agency')",
+    )
+    .bind(USER_ID)
+    .bind(id)
+    .execute(&pool)
+    .await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn reported_requires_a_calendar_date() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    let err = obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("reported", None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        obligations::ReportError::Validation(applications::SubmissionValidationError {
+            field: "reported_at",
+            ..
+        })
+    ));
+
+    let err = obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("reported", Some("02.11.2026")),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, obligations::ReportError::Validation(_)));
+
+    // Well-formed but impossible: code validation passes, the CHECK
+    // constraint on the column rejects it.
+    let err = obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("reported", Some("2026-02-30")),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, obligations::ReportError::Database(_)));
+
+    // Nothing was stored along the way.
+    assert!(
+        obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn leaving_reported_clears_the_date_and_keeps_the_evidence() {
+    let pool = migrated_pool().await;
+    let (opportunity_id, id) = submitted_attempt(&pool).await;
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &obligations::NewReport {
+            status: "reported",
+            reported_at: Some("2026-11-02"),
+            method: Some("manual"),
+            reference: None,
+            recipient_name: None,
+            notes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Correcting an accidental report back to pending clears the filed
+    // date from the row.
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+
+    let stored = obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "pending");
+    assert!(stored.reported_at.is_none());
+    assert_eq!(stored.method, None);
+
+    // The history keeps the old facts: the obligation event appears next
+    // to the application events of the same attempt.
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events[0].event_type,
+        application_events::EVENT_REPORT_STATUS_CHANGED
+    );
+    assert_eq!(events[0].entity_type, "obligation");
+    assert_eq!(events[0].old_value.as_deref(), Some("reported"));
+    assert_eq!(events[0].new_value.as_deref(), Some("pending"));
+    let note = events[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("was reported_at=2026-11-02"));
+}
+
+#[tokio::test]
+async fn report_requires_a_submitted_application() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+
+    // A draft attempt has no submission to report.
+    assert!(matches!(
+        obligations::record_report(
+            &pool,
+            id,
+            obligations::DEFAULT_KIND,
+            &report("pending", None)
+        )
+        .await,
+        Err(obligations::ReportError::NotSubmitted { .. })
+    ));
+
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    assert!(matches!(
+        obligations::record_report(&pool, id, obligations::DEFAULT_KIND, &report("unknown", None))
+            .await,
+        Err(obligations::ReportError::NotSubmitted { stage })
+            if stage == "preparing"
+    ));
+
+    // Once submitted, the reporting state can be recorded as unknown or
+    // pending.
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("unknown", None),
+    )
+    .await
+    .unwrap();
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+
+    let stored = obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "pending");
+}
+
+#[tokio::test]
+async fn other_kind_requires_a_recipient_name() {
+    let pool = migrated_pool().await;
+    let (opportunity_id, id) = submitted_attempt(&pool).await;
+
+    let err = obligations::record_report(&pool, id, "other", &report("pending", None))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        obligations::ReportError::Validation(applications::SubmissionValidationError {
+            field: "recipient_name",
+            ..
+        })
+    ));
+
+    // The default kind carries no recipient requirement.
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+
+    // With a recipient, the reserved kind is accepted as its own row.
+    obligations::record_report(
+        &pool,
+        id,
+        "other",
+        &obligations::NewReport {
+            status: "pending",
+            reported_at: None,
+            method: None,
+            reference: None,
+            recipient_name: Some("District Office Musterstadt"),
+            notes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let obligations_list = obligations::list_obligations_for_opportunity(&pool, opportunity_id)
+        .await
+        .unwrap();
+    assert_eq!(obligations_list.len(), 2);
+}
+
+#[tokio::test]
+async fn correction_is_blocked_while_a_report_is_open() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        applications::correct_submission_to_draft(&pool, id).await,
+        Err(applications::StageTransitionError::ReportingBlocked)
+    ));
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("reported", Some("2026-11-02")),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        applications::correct_submission_to_draft(&pool, id).await,
+        Err(applications::StageTransitionError::ReportingBlocked)
+    ));
+
+    // Setting the report aside unblocks the correction; the submission is
+    // then corrected with the usual clearing and history entry.
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("not_required", None),
+    )
+    .await
+    .unwrap();
+    applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap();
+
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+    assert!(stored.submitted_at.is_none());
+}
+
+#[tokio::test]
+async fn backlog_counts_and_entries_reflect_sql_data() {
+    let pool = migrated_pool().await;
+
+    /// Creates an opportunity and its submitted attempt.
+    async fn submit_against(pool: &SqlitePool, variant: u8) -> i64 {
+        let mut new = sample_opportunity();
+        new.title = format!("Position {variant}");
+        let opportunity_id = insert_opportunity(pool, &new).await.unwrap();
+        let id = applications::insert_application(pool, USER_ID, opportunity_id)
+            .await
+            .unwrap();
+        applications::set_in_progress_stage(pool, id, "preparing")
+            .await
+            .unwrap();
+        applications::record_submission(pool, id, "2026-10-19", "email")
+            .await
+            .unwrap();
+        id
+    }
+
+    let pending_id = submit_against(&pool, 1).await;
+    let unknown_id = submit_against(&pool, 2).await;
+    let reported_id = submit_against(&pool, 3).await;
+    let withdrawn_id = submit_against(&pool, 4).await;
+
+    obligations::record_report(
+        &pool,
+        pending_id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+    obligations::record_report(
+        &pool,
+        reported_id,
+        obligations::DEFAULT_KIND,
+        &report("reported", Some("2026-11-02")),
+    )
+    .await
+    .unwrap();
+    obligations::record_report(
+        &pool,
+        withdrawn_id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+    // A withdrawn attempt leaves the backlog even with a pending report.
+    applications::withdraw(&pool, withdrawn_id).await.unwrap();
+
+    let counts = obligations::reporting_counts(&pool).await.unwrap();
+    assert_eq!(counts.pending, 1);
+    // The attempt without any row counts as unknown.
+    assert_eq!(counts.unknown, 1);
+    assert_eq!(counts.reported, 1);
+    assert_eq!(counts.not_required, 0);
+
+    let entries = obligations::reporting_backlog(&pool, 10).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].application_id, pending_id);
+    assert_eq!(entries[0].status.as_deref(), Some("pending"));
+    assert_eq!(entries[1].application_id, unknown_id);
+    assert!(entries[1].status.is_none());
+}
+
+#[tokio::test]
+async fn authorities_seed_and_learn_labels() {
+    let pool = migrated_pool().await;
+
+    assert_eq!(
+        authorities::seed_authorities_if_empty(&pool, USER_ID, &authorities::DEFAULT_AUTHORITIES)
+            .await
+            .unwrap(),
+        2
+    );
+    // Seeding again changes nothing.
+    assert_eq!(
+        authorities::seed_authorities_if_empty(&pool, USER_ID, &authorities::DEFAULT_AUTHORITIES)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let stored = authorities::list_authorities(&pool, USER_ID).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].name, "Agentur für Arbeit");
+    assert_eq!(stored[0].is_seed, Some(true));
+
+    // A learned label gains its own row, marked as not a seed.
+    let learned = authorities::insert_authority(&pool, USER_ID, "District Office Musterstadt")
+        .await
+        .unwrap()
+        .expect("a non-empty label is stored");
+    // ASCII case differences resolve to the same label; the most recently
+    // used spelling is kept, so a corrected capitalisation replaces the
+    // stored one.
+    let case_variant = authorities::insert_authority(&pool, USER_ID, "district office musterstadt")
+        .await
+        .unwrap()
+        .expect("the label exists");
+    assert_eq!(learned, case_variant);
+    let existing = authorities::insert_authority(&pool, USER_ID, "Jobcenter")
+        .await
+        .unwrap()
+        .expect("the seeded label exists");
+    assert_ne!(existing, learned);
+
+    // An empty label is not stored.
+    assert_eq!(
+        authorities::insert_authority(&pool, USER_ID, "   ")
+            .await
+            .unwrap(),
+        None
+    );
+
+    let stored = authorities::list_authorities(&pool, USER_ID).await.unwrap();
+    assert_eq!(stored.len(), 3);
+    let learned_label = stored
+        .iter()
+        .find(|authority| {
+            authority
+                .name
+                .eq_ignore_ascii_case("district office musterstadt")
+        })
+        .unwrap();
+    assert_eq!(learned_label.name, "district office musterstadt");
+    assert_eq!(learned_label.is_seed, None);
+
+    // Labels are advisory: removing one affects suggestions only and
+    // leaves the obligation rows untouched.
+    sqlx::query("DELETE FROM known_authorities WHERE id = ?")
+        .bind(learned)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remaining = authorities::list_authorities(&pool, USER_ID).await.unwrap();
+    assert_eq!(remaining.len(), 2);
 }

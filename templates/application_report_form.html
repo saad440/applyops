@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}Reporting status — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Reporting status</h1>
+  <p class="muted">{{ context_heading }} · a report is assigned explicitly; a submission never marks it for you.</p>
+</header>
+
+{% match form_error %}
+{% when Some with (message) %}
+<p class="form-error">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+
+<form method="post" action="/applications/{{ application_id }}/report" class="opportunity-form">
+  <div class="field">
+    <label for="status">Status</label>
+    <select id="status" name="status">
+      <option value="pending" {% if status == "pending" %}selected{% endif %}>Pending</option>
+      <option value="reported" {% if status == "reported" %}selected{% endif %}>Reported</option>
+      <option value="not_required" {% if status == "not_required" %}selected{% endif %}>Not required</option>
+      <option value="unknown" {% if status == "unknown" %}selected{% endif %}>Unknown — nothing reliably recorded</option>
+    </select>
+    {% match status_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Status {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="reported_at">Date filed</label>
+    <input id="reported_at" name="reported_at" type="date" value="{{ reported_at }}">
+    <p class="hint">Required when the status is Reported; otherwise it is cleared.</p>
+    {% match reported_at_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Date {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="method">How it was filed</label>
+    <select id="method" name="method">
+      <option value="" {% if method.is_empty() %}selected{% endif %}>Not recorded</option>
+      <option value="portal" {% if method == "portal" %}selected{% endif %}>Through the authority portal</option>
+      <option value="manual" {% if method == "manual" %}selected{% endif %}>Manually — by email, phone, or in person</option>
+      <option value="other" {% if method == "other" %}selected{% endif %}>Another way</option>
+    </select>
+  </div>
+
+  <div class="field">
+    <label for="reference">Reference</label>
+    <input id="reference" name="reference" type="text" value="{{ reference }}">
+  </div>
+
+  <div class="field">
+    <label for="recipient_name">Authority</label>
+    <input id="recipient_name" name="recipient_name" type="text" value="{{ recipient_name }}" list="authority-options" autocomplete="off">
+    <datalist id="authority-options">
+      {% for authority in authorities %}
+      <option value="{{ authority }}">{{ authority }}</option>
+      {% endfor %}
+    </datalist>
+    <p class="hint">Optional; names used here are remembered as suggestions.</p>
+    {% match recipient_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Authority {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="notes">Notes</label>
+    <textarea id="notes" name="notes" rows="3">{{ notes }}</textarea>
+  </div>
+
+  <button type="submit">Save reporting status</button>
+  <p><a href="/opportunities/{{ opportunity_id }}">Cancel and go back</a></p>
+</form>
+{% endblock %}

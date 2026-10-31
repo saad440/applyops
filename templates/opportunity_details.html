@@ -66,6 +66,11 @@
 
       <dt>Employer outcome</dt>
       <dd>{{ application.outcome_display }}</dd>
+
+      {% if application.can_record_report %}
+      <dt>Report</dt>
+      <dd>{{ application.report_display }}</dd>
+      {% endif %}
     </dl>
 
     {% if application.can_prepare %}
@@ -82,11 +87,19 @@
     <p><a href="/applications/{{ application.id }}/submit">Record submission</a></p>
     {% endif %}
     {% if application.can_correct %}
+      {% if application.correction_blocked %}
+    <p class="muted">Correcting to draft is blocked while the report is pending or reported — update the reporting status first.</p>
+    <p><a href="/applications/{{ application.id }}/withdraw">Withdraw</a></p>
+      {% else %}
     <p><a href="/applications/{{ application.id }}/correct">Correct to draft</a>
     · <a href="/applications/{{ application.id }}/withdraw">Withdraw</a></p>
+      {% endif %}
     {% endif %}
     {% if application.can_record_outcome %}
     <p><a href="/applications/{{ application.id }}/outcome">{% if application.has_outcome %}Update employer outcome{% else %}Record employer outcome{% endif %}</a></p>
+    {% endif %}
+    {% if application.can_record_report %}
+    <p><a href="/applications/{{ application.id }}/report">{% if application.has_report %}Update reporting status{% else %}Record reporting status{% endif %}</a></p>
     {% endif %}
     {% if application.is_withdrawn %}
     <p class="muted">This attempt is closed for good.</p>

@@ -11,6 +11,13 @@ async fn test_state() -> AppState {
     db::streams::seed_streams_if_empty(&pool, DEFAULT_USER_ID, &db::streams::DEFAULT_STREAMS)
         .await
         .expect("default streams seeded");
+    db::authorities::seed_authorities_if_empty(
+        &pool,
+        DEFAULT_USER_ID,
+        &db::authorities::DEFAULT_AUTHORITIES,
+    )
+    .await
+    .expect("default authorities seeded");
     AppState { db: pool }
 }
 
@@ -835,4 +842,190 @@ async fn outcome_form_for_a_missing_application_404s() {
     let state = test_state().await;
     let response = outcome_form(State(state), Path(999)).await.into_response();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// --- Reporting status and the report backlog ---
+
+/// The form pairs for marking a report pending.
+fn report_pending_pairs() -> Vec<(String, String)> {
+    vec![("status".to_string(), "pending".to_string())]
+}
+
+#[tokio::test]
+async fn submitted_attempt_offers_the_report_form() {
+    let state = state_with_submitted_application().await;
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Record reporting status"));
+    assert!(body.contains("No record yet"));
+
+    let response = report_form(State(state), Path(1)).await.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Reporting status"));
+    assert!(body.contains("Pending"));
+    assert!(body.contains("Reported"));
+    assert!(body.contains("Not required"));
+    assert!(body.contains("Unknown — nothing reliably recorded"));
+    // The seeded authority labels are offered as suggestions.
+    assert!(body.contains("Agentur für Arbeit"));
+}
+
+#[tokio::test]
+async fn recording_a_report_persists_facts_history_and_labels() {
+    let state = state_with_submitted_application().await;
+    let pairs = vec![
+        ("status".to_string(), "reported".to_string()),
+        ("reported_at".to_string(), "2026-11-02".to_string()),
+        ("method".to_string(), "portal".to_string()),
+        (
+            "recipient_name".to_string(),
+            "District Office Musterstadt".to_string(),
+        ),
+    ];
+    assert_redirect(record_report(State(state.clone()), Path(1), Form(pairs)).await);
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Reported · 2 Nov 2026"));
+    assert!(body.contains("Update reporting status"));
+    assert!(body.contains("Reporting status changed"));
+
+    let stored = db::obligations::get_obligation(&state.db, 1, db::obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "reported");
+    assert_eq!(stored.reported_at.as_deref(), Some("2026-11-02"));
+    assert_eq!(stored.method.as_deref(), Some("portal"));
+
+    // The authority label typed on first use is remembered.
+    let labels = db::authorities::list_authorities(&state.db, DEFAULT_USER_ID)
+        .await
+        .unwrap();
+    assert!(
+        labels
+            .iter()
+            .any(|authority| authority.name == "District Office Musterstadt")
+    );
+}
+
+#[tokio::test]
+async fn report_without_a_date_is_rejected_on_the_form() {
+    let state = state_with_submitted_application().await;
+    let pairs = vec![("status".to_string(), "reported".to_string())];
+    let response = record_report(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("must not be empty"));
+
+    let stored = db::obligations::get_obligation(&state.db, 1, db::obligations::DEFAULT_KIND)
+        .await
+        .unwrap();
+    assert!(stored.is_none());
+}
+
+#[tokio::test]
+async fn report_on_a_draft_attempt_is_rejected_with_feedback() {
+    let state = state_with_draft_application().await;
+    let response = record_report(State(state.clone()), Path(1), Form(report_pending_pairs()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("reporting status exists only for submitted applications"));
+
+    let stored = db::obligations::get_obligation(&state.db, 1, db::obligations::DEFAULT_KIND)
+        .await
+        .unwrap();
+    assert!(stored.is_none());
+}
+
+#[tokio::test]
+async fn correction_is_blocked_until_the_report_is_set_aside() {
+    let state = state_with_submitted_application().await;
+    assert_redirect(
+        record_report(State(state.clone()), Path(1), Form(report_pending_pairs())).await,
+    );
+
+    // The details page states the block instead of offering the link.
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("blocked while the report is pending or reported"));
+    assert!(!body.contains("/applications/1/correct"));
+
+    // The correction rejects with an explanatory message and changes nothing.
+    let response = correct_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("cannot be corrected while a report"));
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+
+    // Setting the report to not required unblocks the correction.
+    let pairs = vec![("status".to_string(), "not_required".to_string())];
+    assert_redirect(record_report(State(state.clone()), Path(1), Form(pairs)).await);
+    assert_redirect(correct_application(State(state.clone()), Path(1)).await);
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+
+    let body = body_string(
+        opportunity_details(State(state), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Submission corrected"));
+}
+
+#[tokio::test]
+async fn the_report_backlog_counts_and_lists_outstanding_work() {
+    let state = state_with_submitted_application().await;
+
+    // The submitted attempt without any record counts as unknown.
+    let response = report_backlog(State(state.clone())).await.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("0 pending · 1 unknown"));
+    assert!(body.contains("Report: Unknown"));
+
+    assert_redirect(
+        record_report(State(state.clone()), Path(1), Form(report_pending_pairs())).await,
+    );
+    let body = body_string(report_backlog(State(state.clone())).await.into_response()).await;
+    assert!(body.contains("1 pending · 0 unknown"));
+    assert!(body.contains("Report: Pending"));
+
+    // Marking the report done empties the backlog.
+    let pairs = vec![
+        ("status".to_string(), "reported".to_string()),
+        ("reported_at".to_string(), "2026-11-02".to_string()),
+    ];
+    assert_redirect(record_report(State(state.clone()), Path(1), Form(pairs)).await);
+    let body = body_string(report_backlog(State(state)).await.into_response()).await;
+    assert!(body.contains("Nothing outstanding"));
+    assert!(body.contains("1 reported"));
 }

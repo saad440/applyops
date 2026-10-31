@@ -239,10 +239,22 @@ struct ApplicationAttemptVm {
     can_record_outcome: bool,
     /// Whether a concrete outcome is recorded (anything but `unknown`).
     has_outcome: bool,
+    /// Reporting obligations exist only on submitted attempts.
+    can_record_report: bool,
+    /// Whether a reporting record exists (anything saved, including `unknown`).
+    has_report: bool,
+    report_display: String,
+    /// Whether the submitted-to-draft correction is blocked because a
+    /// reporting obligation of this attempt is pending or reported.
+    correction_blocked: bool,
 }
 
 impl ApplicationAttemptVm {
-    fn from_application(application: &db::applications::Application) -> Self {
+    fn from_application(
+        application: &db::applications::Application,
+        report: Option<&db::obligations::Obligation>,
+        correction_blocked: bool,
+    ) -> Self {
         let stage = application.stage.as_str();
         let outcome_display = match application.outcome_at.as_deref() {
             Some(date) if application.employer_outcome != "unknown" => format!(
@@ -251,6 +263,17 @@ impl ApplicationAttemptVm {
                 format_date_human(date)
             ),
             _ => display_label(&application.employer_outcome),
+        };
+
+        let report_display = match report {
+            None => "No record yet".to_string(),
+            Some(report) => match report.status.as_str() {
+                "reported" => match report.reported_at.as_deref() {
+                    Some(date) => format!("Reported · {}", format_date_human(date)),
+                    None => "Reported".to_string(),
+                },
+                other => display_label(other),
+            },
         };
 
         Self {
@@ -271,6 +294,10 @@ impl ApplicationAttemptVm {
             show_channel: stage == "submitted" || stage == "withdrawn",
             can_record_outcome: stage == "submitted",
             has_outcome: application.employer_outcome != "unknown",
+            can_record_report: stage == "submitted",
+            has_report: report.is_some(),
+            report_display,
+            correction_blocked,
         }
     }
 }
@@ -289,6 +316,7 @@ impl ApplicationEventVm {
             db::application_events::EVENT_SUBMISSION_CORRECTED => "Submission corrected",
             db::application_events::EVENT_WITHDRAWN => "Application withdrawn",
             db::application_events::EVENT_OUTCOME_CHANGED => "Employer outcome changed",
+            db::application_events::EVENT_REPORT_STATUS_CHANGED => "Reporting status changed",
             other => other,
         }
         .to_string();
@@ -308,7 +336,7 @@ impl ApplicationEventVm {
 /// Turns a stored code such as `employment_agency` into a readable label such
 /// as `Employment agency`; unknown codes pass through unchanged.
 fn display_label(code: &str) -> String {
-    const LABELS: [(&str, &str); 10] = [
+    const LABELS: [(&str, &str); 16] = [
         ("email", "Email"),
         ("employer_portal", "Employer portal"),
         ("employment_agency", "Employment agency"),
@@ -319,6 +347,12 @@ fn display_label(code: &str) -> String {
         ("offer", "Offer"),
         ("rejected", "Rejected"),
         ("withdrawn", "Withdrawn"),
+        ("reported", "Reported"),
+        ("not_required", "Not required"),
+        ("jobcenter", "Jobcenter"),
+        ("foreign_authority", "Foreign authority"),
+        ("portal", "Authority portal"),
+        ("manual", "Manual"),
     ];
 
     LABELS
@@ -369,6 +403,45 @@ struct OutcomeFormTemplate {
     outcome_error: Option<String>,
     outcome_at_error: Option<String>,
     form_error: Option<String>,
+}
+
+/// The form for recording or updating the reporting status of a submitted
+/// application; the first save creates the obligation row.
+#[derive(Template)]
+#[template(path = "application_report_form.html")]
+struct ReportFormTemplate {
+    application_id: i64,
+    opportunity_id: i64,
+    context_heading: String,
+    status: String,
+    reported_at: String,
+    method: String,
+    reference: String,
+    recipient_name: String,
+    notes: String,
+    /// Known authority labels offered as suggestions.
+    authorities: Vec<String>,
+    status_error: Option<String>,
+    reported_at_error: Option<String>,
+    recipient_error: Option<String>,
+    form_error: Option<String>,
+}
+
+/// The report backlog page: submitted attempts whose report is pending or
+/// not yet recorded, with separate counts.
+#[derive(Template)]
+#[template(path = "report_backlog.html")]
+struct ReportBacklogTemplate {
+    counts: db::obligations::BacklogCounts,
+    entries: Vec<BacklogEntryVm>,
+}
+
+/// One backlog row prepared for display.
+struct BacklogEntryVm {
+    opportunity_id: i64,
+    heading: String,
+    submitted_display: String,
+    status_display: String,
 }
 
 /// Formats an ISO `YYYY-MM-DD` date as e.g. `15 Jan 2027` for display.
@@ -571,6 +644,17 @@ async fn main() {
         tracing::info!(seeded_streams, "seeded default streams");
     }
 
+    let seeded_authorities = db::authorities::seed_authorities_if_empty(
+        &pool,
+        DEFAULT_USER_ID,
+        &db::authorities::DEFAULT_AUTHORITIES,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("could not seed default authority labels: {err}"));
+    if seeded_authorities > 0 {
+        tracing::info!(seeded_authorities, "seeded default authority labels");
+    }
+
     tracing::info!(%db_path, "database ready");
 
     // Middleware applies to the routes registered before it.
@@ -605,6 +689,11 @@ async fn main() {
             "/applications/{id}/outcome",
             get(outcome_form).post(record_outcome),
         )
+        .route(
+            "/applications/{id}/report",
+            get(report_form).post(record_report),
+        )
+        .route("/reports", get(report_backlog))
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
         .layer(middleware::from_fn(log_requests));
@@ -800,9 +889,27 @@ async fn render_opportunity_details(
             Vec::new()
         }
     };
+    let obligations =
+        match db::obligations::list_obligations_for_opportunity(&state.db, opportunity_id).await {
+            Ok(obligations) => obligations,
+            Err(err) => {
+                tracing::error!(%err, "failed to load reporting obligations");
+                Vec::new()
+            }
+        };
     let attempts: Vec<ApplicationAttemptVm> = applications
         .iter()
-        .map(ApplicationAttemptVm::from_application)
+        .map(|application| {
+            let report = obligations.iter().find(|obligation| {
+                obligation.application_id == application.id
+                    && obligation.kind == db::obligations::DEFAULT_KIND
+            });
+            let correction_blocked = obligations.iter().any(|obligation| {
+                obligation.application_id == application.id
+                    && (obligation.status == "pending" || obligation.status == "reported")
+            });
+            ApplicationAttemptVm::from_application(application, report, correction_blocked)
+        })
         .collect();
 
     let has_active_attempt =
@@ -978,6 +1085,17 @@ async fn apply_stage_transition(
                 Some(format!(
                     "This application is currently {from}; the requested change to {to} does not apply. Reload the page and retry."
                 )),
+            )
+            .await
+        }
+        Err(db::applications::StageTransitionError::ReportingBlocked) => {
+            render_opportunity_details(
+                state,
+                application.opportunity_id,
+                Some(
+                    "The recorded submission cannot be corrected while a report for it is pending or already reported. Update the reporting status first."
+                        .to_string(),
+                ),
             )
             .await
         }
@@ -1305,6 +1423,221 @@ async fn record_outcome(
             HtmlTemplate(template).into_response()
         }
     }
+}
+
+/// Loads the known authority labels for form suggestions, or an empty list
+/// when they cannot be read; the authority field stays usable as free text
+/// either way.
+async fn authority_suggestions(state: &AppState) -> Vec<String> {
+    match db::authorities::list_authorities(&state.db, DEFAULT_USER_ID).await {
+        Ok(authorities) => authorities.into_iter().map(|a| a.name).collect(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load authority labels");
+            Vec::new()
+        }
+    }
+}
+
+/// Builds the report form view model for one application, prefilled with
+/// the stored reporting status when an obligation row exists.
+async fn report_form_template(
+    state: &AppState,
+    application: &db::applications::Application,
+) -> ReportFormTemplate {
+    let context_heading =
+        match db::opportunities::get_opportunity(&state.db, application.opportunity_id).await {
+            Ok(Some(opportunity)) => {
+                format!("{} — {}", opportunity.organization, opportunity.title)
+            }
+            Ok(None) | Err(_) => format!("Application attempt {}", application.id),
+        };
+
+    let stored =
+        db::obligations::get_obligation(&state.db, application.id, db::obligations::DEFAULT_KIND)
+            .await
+            .ok()
+            .flatten();
+
+    ReportFormTemplate {
+        application_id: application.id,
+        opportunity_id: application.opportunity_id,
+        context_heading,
+        status: stored
+            .as_ref()
+            .map(|o| o.status.clone())
+            .unwrap_or_else(|| "pending".to_string()),
+        reported_at: stored
+            .as_ref()
+            .and_then(|o| o.reported_at.clone())
+            .unwrap_or_default(),
+        method: stored
+            .as_ref()
+            .and_then(|o| o.method.clone())
+            .unwrap_or_default(),
+        reference: stored
+            .as_ref()
+            .and_then(|o| o.reference.clone())
+            .unwrap_or_default(),
+        recipient_name: stored
+            .as_ref()
+            .and_then(|o| o.recipient_name.clone())
+            .unwrap_or_default(),
+        notes: stored
+            .as_ref()
+            .and_then(|o| o.notes.clone())
+            .unwrap_or_default(),
+        authorities: authority_suggestions(state).await,
+        status_error: None,
+        reported_at_error: None,
+        recipient_error: None,
+        form_error: None,
+    }
+}
+
+/// `GET /applications/{id}/report` — the form for recording or updating the
+/// reporting status of a submitted application.
+async fn report_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => {
+            HtmlTemplate(report_form_template(&state, &application).await).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `POST /applications/{id}/report` — validates and records the reporting
+/// status, creating the obligation row on first save. Invalid input
+/// re-renders the form with the entered values and field errors.
+async fn record_report(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let status = form_field(&pairs, "status");
+    let reported_at = form_field(&pairs, "reported_at");
+    let method = form_field(&pairs, "method");
+    let reference = form_field(&pairs, "reference");
+    let recipient_name = form_field(&pairs, "recipient_name");
+    let notes = form_field(&pairs, "notes");
+
+    let application = match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+        }
+    };
+
+    let mut template = report_form_template(&state, &application).await;
+    template.status = status.clone();
+    template.reported_at = reported_at.clone();
+    template.method = method.clone();
+    template.reference = reference.clone();
+    template.recipient_name = recipient_name.clone();
+    template.notes = notes.clone();
+
+    let new = db::obligations::NewReport {
+        status: &status,
+        reported_at: Some(&reported_at),
+        method: Some(&method),
+        reference: Some(&reference),
+        recipient_name: Some(&recipient_name),
+        notes: Some(&notes),
+    };
+
+    match db::obligations::record_report(&state.db, id, db::obligations::DEFAULT_KIND, &new).await
+    {
+        Ok(()) => {
+            // Remember a newly used authority label so future forms offer it.
+            if !recipient_name.is_empty()
+                && let Err(err) =
+                    db::authorities::insert_authority(&state.db, DEFAULT_USER_ID, &recipient_name)
+                        .await
+            {
+                tracing::warn!(%err, "could not remember authority label");
+            }
+            Redirect::to(&format!("/opportunities/{}", application.opportunity_id))
+                .into_response()
+        }
+        Err(db::obligations::ReportError::Validation(err)) => {
+            let message = Some(err.reason.to_string());
+            match err.field {
+                "status" => template.status_error = message,
+                "reported_at" => template.reported_at_error = message,
+                "recipient_name" => template.recipient_error = message,
+                _ => template.form_error = Some(format!("{} {}", err.field, err.reason)),
+            }
+            HtmlTemplate(template).into_response()
+        }
+        Err(db::obligations::ReportError::NotSubmitted { stage }) => {
+            render_opportunity_details(
+                &state,
+                application.opportunity_id,
+                Some(format!(
+                    "This application is currently {stage}; a reporting status exists only for submitted applications."
+                )),
+            )
+            .await
+        }
+        Err(db::obligations::ReportError::ApplicationMissing) => {
+            (StatusCode::NOT_FOUND, "No such application").into_response()
+        }
+        Err(db::obligations::ReportError::Database(err)) => {
+            tracing::error!(%err, "failed to record reporting status");
+            template.form_error =
+                Some("The reporting status could not be stored. Please try again.".to_string());
+            HtmlTemplate(template).into_response()
+        }
+    }
+}
+
+/// `GET /reports` — the report backlog: submitted attempts whose report is
+/// pending or not yet recorded, with separate counts from SQL data.
+async fn report_backlog(State(state): State<AppState>) -> Response {
+    let counts = match db::obligations::reporting_counts(&state.db).await {
+        Ok(counts) => counts,
+        Err(err) => {
+            tracing::error!(%err, "failed to count reporting states");
+            db::obligations::BacklogCounts::default()
+        }
+    };
+
+    let entries = match db::obligations::reporting_backlog(&state.db, 100).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::error!(%err, "failed to load the report backlog");
+            Vec::new()
+        }
+    };
+
+    let entry_views: Vec<BacklogEntryVm> = entries
+        .iter()
+        .map(|entry| BacklogEntryVm {
+            opportunity_id: entry.opportunity_id,
+            heading: format!("{} — {}", entry.organization, entry.title),
+            submitted_display: entry
+                .submitted_at
+                .as_deref()
+                .map(format_date_human)
+                .unwrap_or_else(|| "Unknown date".to_string()),
+            status_display: entry
+                .status
+                .as_deref()
+                .map(display_label)
+                .unwrap_or_else(|| "Unknown".to_string()),
+        })
+        .collect();
+
+    HtmlTemplate(ReportBacklogTemplate {
+        counts,
+        entries: entry_views,
+    })
+    .into_response()
 }
 
 /// `GET /healthz` — health check for scripted verification.

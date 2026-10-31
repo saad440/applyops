@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}Report backlog — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Report backlog</h1>
+  <p class="muted">Submitted applications whose report is pending or not yet recorded.</p>
+</header>
+
+<section class="card">
+  <p>Outstanding: {{ counts.pending }} pending · {{ counts.unknown }} unknown</p>
+  <p class="muted">Already handled: {{ counts.reported }} reported · {{ counts.not_required }} not required</p>
+</section>
+
+{% if entries.is_empty() %}
+<section class="card">
+  <p>Nothing outstanding. Submitted applications awaiting a report appear here.</p>
+</section>
+{% else %}
+<ul class="opportunity-list">
+  {% for entry in entries %}
+  <li class="card">
+    <h2><a href="/opportunities/{{ entry.opportunity_id }}">{{ entry.heading }}</a></h2>
+    <p>Submitted: {{ entry.submitted_display }} · Report: {{ entry.status_display }}</p>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<p class="footer-links"><a href="/">Back to the list</a></p>
+{% endblock %}
