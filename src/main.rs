@@ -247,6 +247,8 @@ struct ApplicationAttemptVm {
     /// Whether the submitted-to-draft correction is blocked because a
     /// reporting obligation of this attempt is pending or reported.
     correction_blocked: bool,
+    /// User-curated follow-up actions of this attempt.
+    actions: Vec<ActionVm>,
 }
 
 impl ApplicationAttemptVm {
@@ -254,6 +256,7 @@ impl ApplicationAttemptVm {
         application: &db::applications::Application,
         report: Option<&db::obligations::Obligation>,
         correction_blocked: bool,
+        actions: Vec<ActionVm>,
     ) -> Self {
         let stage = application.stage.as_str();
         let outcome_display = match application.outcome_at.as_deref() {
@@ -298,6 +301,42 @@ impl ApplicationAttemptVm {
             has_report: report.is_some(),
             report_display,
             correction_blocked,
+            actions,
+        }
+    }
+}
+
+/// One follow-up action as displayed on the details page.
+struct ActionVm {
+    id: i64,
+    title: String,
+    /// Whether the action is still open.
+    is_open: bool,
+    due_display: Option<String>,
+    completed_display: Option<String>,
+    notes_display: Option<String>,
+}
+
+impl ActionVm {
+    fn from_action(action: &db::actions::Action) -> Self {
+        let completed_display = action.completed_at.as_deref().map(|moment| {
+            // The completion moment is stored as a timestamp; the list
+            // shows its calendar date.
+            format!(
+                "Done · {}",
+                format_date_human(moment.get(..10).unwrap_or(moment))
+            )
+        });
+        Self {
+            id: action.id,
+            title: action.title.clone(),
+            is_open: action.completed_at.is_none(),
+            due_display: action
+                .due_at
+                .as_deref()
+                .map(|date| format!("Due {}", format_date_human(date))),
+            completed_display,
+            notes_display: action.notes.clone(),
         }
     }
 }
@@ -694,6 +733,10 @@ async fn main() {
             get(report_form).post(record_report),
         )
         .route("/reports", get(report_backlog))
+        .route("/applications/{id}/actions", post(add_application_action))
+        .route("/actions/{id}/complete", post(complete_application_action))
+        .route("/actions/{id}/reopen", post(reopen_application_action))
+        .route("/actions/{id}/delete", post(delete_application_action))
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
         .layer(middleware::from_fn(log_requests));
@@ -897,20 +940,31 @@ async fn render_opportunity_details(
                 Vec::new()
             }
         };
-    let attempts: Vec<ApplicationAttemptVm> = applications
-        .iter()
-        .map(|application| {
-            let report = obligations.iter().find(|obligation| {
-                obligation.application_id == application.id
-                    && obligation.kind == db::obligations::DEFAULT_KIND
-            });
-            let correction_blocked = obligations.iter().any(|obligation| {
-                obligation.application_id == application.id
-                    && (obligation.status == "pending" || obligation.status == "reported")
-            });
-            ApplicationAttemptVm::from_application(application, report, correction_blocked)
-        })
-        .collect();
+    let mut attempts = Vec::with_capacity(applications.len());
+    for application in &applications {
+        let report = obligations.iter().find(|obligation| {
+            obligation.application_id == application.id
+                && obligation.kind == db::obligations::DEFAULT_KIND
+        });
+        let correction_blocked = obligations.iter().any(|obligation| {
+            obligation.application_id == application.id
+                && (obligation.status == "pending" || obligation.status == "reported")
+        });
+        let actions =
+            match db::actions::list_actions_for_application(&state.db, application.id).await {
+                Ok(actions) => actions.iter().map(ActionVm::from_action).collect(),
+                Err(err) => {
+                    tracing::error!(%err, "failed to load follow-up actions");
+                    Vec::new()
+                }
+            };
+        attempts.push(ApplicationAttemptVm::from_application(
+            application,
+            report,
+            correction_blocked,
+            actions,
+        ));
+    }
 
     let has_active_attempt =
         match db::applications::active_application_for_opportunity(&state.db, opportunity_id).await
@@ -1638,6 +1692,132 @@ async fn report_backlog(State(state): State<AppState>) -> Response {
         entries: entry_views,
     })
     .into_response()
+}
+
+/// POST /applications/{id}/actions — adds a user-curated follow-up action
+/// to an application attempt. An action enters the world only through this
+/// form: no other workflow creates one, and none writes a history entry.
+async fn add_application_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let title = form_field(&pairs, "title");
+    let due_at = form_field(&pairs, "due_at");
+    let notes = form_field(&pairs, "notes");
+
+    let application = match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+        }
+    };
+
+    let new = db::actions::NewAction {
+        title: &title,
+        due_at: Some(&due_at),
+        notes: Some(&notes),
+    };
+    match db::actions::add_action(&state.db, id, &new).await {
+        Ok(_) => {
+            Redirect::to(&format!("/opportunities/{}", application.opportunity_id)).into_response()
+        }
+        Err(db::actions::ActionError::Validation(err)) => {
+            render_opportunity_details(
+                &state,
+                application.opportunity_id,
+                Some(format!(
+                    "Follow-up was not saved: {} {}.",
+                    err.field, err.reason
+                )),
+            )
+            .await
+        }
+        Err(db::actions::ActionError::ApplicationMissing) => {
+            (StatusCode::NOT_FOUND, "No such application").into_response()
+        }
+        Err(db::actions::ActionError::Database(err)) => {
+            tracing::error!(%err, "failed to store the follow-up action");
+            render_opportunity_details(
+                &state,
+                application.opportunity_id,
+                Some("The follow-up could not be stored. Please try again.".to_string()),
+            )
+            .await
+        }
+    }
+}
+
+/// POST /actions/{id}/complete — marks a follow-up action done. Completion
+/// is a plain flag on a user-curated entry: no stage, obligation, or
+/// history change follows from it.
+async fn complete_application_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    set_action_done(state, id, true).await
+}
+
+/// POST /actions/{id}/reopen — clears the completion flag again.
+async fn reopen_application_action(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    set_action_done(state, id, false).await
+}
+
+/// Shared body of the complete and reopen handlers.
+async fn set_action_done(state: AppState, action_id: i64, completed: bool) -> Response {
+    let Some(action) = load_action(&state, action_id).await else {
+        return (StatusCode::NOT_FOUND, "No such follow-up").into_response();
+    };
+    match db::actions::set_action_completed(&state.db, action_id, completed).await {
+        Ok(_) => redirect_for_action(&state, &action).await,
+        Err(err) => {
+            tracing::error!(%err, "failed to update the follow-up action");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// POST /actions/{id}/delete — removes a follow-up action outright.
+/// Actions carry no evidence, so removal leaves nothing behind.
+async fn delete_application_action(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let Some(action) = load_action(&state, id).await else {
+        return (StatusCode::NOT_FOUND, "No such follow-up").into_response();
+    };
+    match db::actions::delete_action(&state.db, id).await {
+        Ok(_) => redirect_for_action(&state, &action).await,
+        Err(err) => {
+            tracing::error!(%err, "failed to delete the follow-up action");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// Reads one follow-up action, treating database failures as missing.
+async fn load_action(state: &AppState, action_id: i64) -> Option<db::actions::Action> {
+    match db::actions::get_action(&state.db, action_id).await {
+        Ok(action) => action,
+        Err(err) => {
+            tracing::error!(%err, "failed to load the follow-up action");
+            None
+        }
+    }
+}
+
+/// Redirects to the opportunity page that owns the attempt the action
+/// belongs to.
+async fn redirect_for_action(state: &AppState, action: &db::actions::Action) -> Response {
+    match db::applications::get_application(&state.db, action.application_id).await {
+        Ok(Some(application)) => {
+            Redirect::to(&format!("/opportunities/{}", application.opportunity_id)).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
 }
 
 /// `GET /healthz` — health check for scripted verification.

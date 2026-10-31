@@ -1029,3 +1029,169 @@ async fn the_report_backlog_counts_and_lists_outstanding_work() {
     assert!(body.contains("Nothing outstanding"));
     assert!(body.contains("1 reported"));
 }
+
+// --- Follow-up actions ---
+
+/// The form pairs for adding a follow-up action; everything optional stays
+/// empty when `None`.
+fn follow_up_pairs(
+    title: &str,
+    due_at: Option<&str>,
+    notes: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut pairs = vec![("title".to_string(), title.to_string())];
+    if let Some(due_at) = due_at {
+        pairs.push(("due_at".to_string(), due_at.to_string()));
+    }
+    if let Some(notes) = notes {
+        pairs.push(("notes".to_string(), notes.to_string()));
+    }
+    pairs
+}
+
+#[tokio::test]
+async fn the_details_page_offers_the_follow_ups_form() {
+    let state = state_with_submitted_application().await;
+    let body = body_string(
+        opportunity_details(State(state), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Follow-ups"));
+    assert!(body.contains("No follow-ups recorded"));
+    assert!(body.contains(r#"action="/applications/1/actions""#));
+}
+
+#[tokio::test]
+async fn adding_a_follow_up_persists_and_shows_it() {
+    let state = state_with_submitted_application().await;
+    let pairs = follow_up_pairs(
+        "Ask for feedback",
+        Some("2026-11-05"),
+        Some("Reply to the recruiter"),
+    );
+    assert_redirect(add_application_action(State(state.clone()), Path(1), Form(pairs)).await);
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Ask for feedback"));
+    assert!(body.contains("Due 5 Nov 2026"));
+    assert!(body.contains("Reply to the recruiter"));
+    assert!(body.contains("Mark done"));
+    assert!(body.contains("Delete"));
+
+    let stored = db::actions::list_actions_for_application(&state.db, 1)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].due_at.as_deref(), Some("2026-11-05"));
+}
+
+#[tokio::test]
+async fn an_empty_follow_up_title_is_rejected_with_feedback() {
+    let state = state_with_submitted_application().await;
+    let pairs = follow_up_pairs("   ", None, None);
+    let response = add_application_action(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Follow-up was not saved: title must not be empty"));
+    assert!(
+        db::actions::list_actions_for_application(&state.db, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_follow_up_due_date_is_rejected_with_feedback() {
+    let state = state_with_submitted_application().await;
+    let pairs = follow_up_pairs("Call back", Some("soon"), None);
+    let response = add_application_action(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Follow-up was not saved: due_at must be a calendar date"));
+}
+
+#[tokio::test]
+async fn completing_and_reopening_a_follow_up_changes_nothing_else() {
+    let state = state_with_submitted_application().await;
+    let pairs = follow_up_pairs("Thank the contact", None, None);
+    assert_redirect(add_application_action(State(state.clone()), Path(1), Form(pairs)).await);
+
+    // Completion shows the done marker and the reopen affordance.
+    assert_redirect(complete_application_action(State(state.clone()), Path(1)).await);
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Done ·"));
+    assert!(body.contains("Reopen"));
+
+    // Completion changed neither the stage nor the outcome, and the
+    // history still holds only the submission event. History entries
+    // render as <li><strong> on one line, action rows do not.
+    let application = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.stage, "submitted");
+    assert_eq!(application.employer_outcome, "unknown");
+    assert_eq!(body.matches("<li><strong>").count(), 1);
+
+    // Reopening clears the marker again.
+    assert_redirect(reopen_application_action(State(state.clone()), Path(1)).await);
+    let body = body_string(
+        opportunity_details(State(state), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(!body.contains("Done ·"));
+    assert!(body.contains("Mark done"));
+}
+
+#[tokio::test]
+async fn deleting_a_follow_up_removes_it_from_the_page() {
+    let state = state_with_submitted_application().await;
+    let pairs = follow_up_pairs("Book travel", None, None);
+    assert_redirect(add_application_action(State(state.clone()), Path(1), Form(pairs)).await);
+    assert_redirect(delete_application_action(State(state.clone()), Path(1)).await);
+
+    let body = body_string(
+        opportunity_details(State(state), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(!body.contains("Book travel"));
+    assert!(body.contains("No follow-ups recorded"));
+}
+
+#[tokio::test]
+async fn follow_up_changes_for_a_missing_row_404() {
+    let state = state_with_submitted_application().await;
+    let complete = complete_application_action(State(state.clone()), Path(99))
+        .await
+        .into_response();
+    let reopen = reopen_application_action(State(state.clone()), Path(99))
+        .await
+        .into_response();
+    let delete = delete_application_action(State(state), Path(99))
+        .await
+        .into_response();
+    for response in [complete, reopen, delete] {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

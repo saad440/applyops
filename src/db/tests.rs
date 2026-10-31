@@ -1466,3 +1466,289 @@ async fn authorities_seed_and_learn_labels() {
     let remaining = authorities::list_authorities(&pool, USER_ID).await.unwrap();
     assert_eq!(remaining.len(), 2);
 }
+
+use super::actions;
+
+/// Follow-up input with everything optional left empty.
+fn action(
+    title: &'static str,
+    due_at: Option<&'static str>,
+    notes: Option<&'static str>,
+) -> actions::NewAction<'static> {
+    actions::NewAction {
+        title,
+        due_at,
+        notes,
+    }
+}
+
+#[tokio::test]
+async fn follow_up_round_trip_preserves_fields() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    let action_id = actions::add_action(
+        &pool,
+        id,
+        &action(
+            "Follow up with the employer",
+            Some("2026-11-05"),
+            Some("Ask about the interview panel "),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let stored = actions::get_action(&pool, action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.user_id, USER_ID);
+    assert_eq!(stored.application_id, id);
+    assert_eq!(stored.title, "Follow up with the employer");
+    assert_eq!(stored.due_at.as_deref(), Some("2026-11-05"));
+    assert!(stored.completed_at.is_none());
+    assert_eq!(
+        stored.notes.as_deref(),
+        Some("Ask about the interview panel")
+    );
+    assert!(!stored.created_at.is_empty());
+}
+
+#[tokio::test]
+async fn follow_up_validation_rejects_empty_title_and_bad_dates() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    let err = actions::add_action(&pool, id, &action("   ", None, None))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        actions::ActionError::Validation(ref err) if err.field == "title"
+    ));
+
+    let err = actions::add_action(&pool, id, &action("Call", Some("soon"), None))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        actions::ActionError::Validation(ref err) if err.field == "due_at"
+    ));
+
+    // A calendar-impossible date passes the format check but is rejected
+    // by the column's CHECK constraint.
+    let err = actions::add_action(&pool, id, &action("Call", Some("2027-02-30"), None))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, actions::ActionError::Database(_)));
+
+    // The attempt still holds no actions after the rejected saves.
+    assert!(
+        actions::list_actions_for_application(&pool, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn follow_up_requires_an_existing_application() {
+    let pool = migrated_pool().await;
+    let err = actions::add_action(&pool, 999, &action("Call back", None, None))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, actions::ActionError::ApplicationMissing));
+}
+
+#[tokio::test]
+async fn an_attempt_holds_zero_or_many_follow_ups() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    assert!(
+        actions::list_actions_for_application(&pool, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    for title in [
+        "Ask for feedback",
+        "Prepare for the interview",
+        "Send portfolio",
+    ] {
+        actions::add_action(&pool, id, &action(title, None, None))
+            .await
+            .unwrap();
+    }
+    let stored = actions::list_actions_for_application(&pool, id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0].title, "Ask for feedback");
+}
+
+#[tokio::test]
+async fn open_follow_ups_sort_by_due_date_with_completed_last() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    actions::add_action(&pool, id, &action("Undated", None, None))
+        .await
+        .unwrap();
+    actions::add_action(&pool, id, &action("Later", Some("2026-12-01"), None))
+        .await
+        .unwrap();
+    actions::add_action(&pool, id, &action("Sooner", Some("2026-11-05"), None))
+        .await
+        .unwrap();
+
+    // Completing the undated one moves it to the end even though it was
+    // created first.
+    let stored = actions::list_actions_for_application(&pool, id)
+        .await
+        .unwrap();
+    let undated = stored.iter().find(|a| a.title == "Undated").unwrap().id;
+    actions::set_action_completed(&pool, undated, true)
+        .await
+        .unwrap();
+
+    let stored = actions::list_actions_for_application(&pool, id)
+        .await
+        .unwrap();
+    let titles: Vec<&str> = stored.iter().map(|a| a.title.as_str()).collect();
+    assert_eq!(titles, ["Sooner", "Later", "Undated"]);
+    assert!(stored[2].completed_at.is_some());
+}
+
+#[tokio::test]
+async fn completing_a_follow_up_changes_no_stage_or_report_state_and_writes_no_event() {
+    let pool = migrated_pool().await;
+    let (opportunity_id, id) = submitted_attempt(&pool).await;
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("pending", None),
+    )
+    .await
+    .unwrap();
+    let action_id = actions::add_action(&pool, id, &action("Thank the contact", None, None))
+        .await
+        .unwrap();
+    let events_before = application_events::list_events_for_opportunity(&pool, opportunity_id, 100)
+        .await
+        .unwrap()
+        .len();
+
+    actions::set_action_completed(&pool, action_id, true)
+        .await
+        .unwrap();
+
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+    let obligation = obligations::get_obligation(&pool, id, obligations::DEFAULT_KIND)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.status, "pending");
+    let events_after = application_events::list_events_for_opportunity(&pool, opportunity_id, 100)
+        .await
+        .unwrap();
+    assert_eq!(events_after.len(), events_before);
+}
+
+#[tokio::test]
+async fn reopening_clears_the_completion_moment() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+    let action_id = actions::add_action(&pool, id, &action("Check deadline extension", None, None))
+        .await
+        .unwrap();
+
+    actions::set_action_completed(&pool, action_id, true)
+        .await
+        .unwrap();
+    let stored = actions::get_action(&pool, action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.completed_at.is_some());
+
+    actions::set_action_completed(&pool, action_id, false)
+        .await
+        .unwrap();
+    let stored = actions::get_action(&pool, action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.completed_at.is_none());
+}
+
+#[tokio::test]
+async fn deleting_a_follow_up_removes_the_row() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+    let action_id = actions::add_action(&pool, id, &action("Book travel", None, None))
+        .await
+        .unwrap();
+
+    assert!(actions::delete_action(&pool, action_id).await.unwrap());
+    assert!(
+        actions::get_action(&pool, action_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Deleting again reports that nothing was found.
+    assert!(!actions::delete_action(&pool, action_id).await.unwrap());
+}
+
+#[tokio::test]
+async fn no_other_workflow_creates_or_touches_follow_ups() {
+    let pool = migrated_pool().await;
+    let (_, id) = submitted_attempt(&pool).await;
+
+    // The whole lifecycle around submissions, outcomes, and reporting
+    // runs without creating, completing, or deleting any follow-up.
+    applications::record_employer_outcome(&pool, id, "interview", Some("2026-10-25"))
+        .await
+        .unwrap();
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("reported", Some("2026-11-02")),
+    )
+    .await
+    .unwrap();
+    assert!(
+        actions::list_actions_for_application(&pool, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    obligations::record_report(
+        &pool,
+        id,
+        obligations::DEFAULT_KIND,
+        &report("not_required", None),
+    )
+    .await
+    .unwrap();
+    applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap();
+    assert!(
+        actions::list_actions_for_application(&pool, id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

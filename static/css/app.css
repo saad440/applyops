@@ -152,6 +152,54 @@ a {
   margin-bottom: var(--space-1);
 }
 
+/* Follow-up actions on the application details page. */
+.action-list {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-4);
+}
+
+.action-list li {
+  margin-bottom: var(--space-2);
+}
+
+.action-list form {
+  display: inline;
+  margin-right: var(--space-2);
+}
+
+.action-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: end;
+  margin: var(--space-3) 0 0;
+}
+
+.action-form label {
+  font-size: 0.9rem;
+  color: var(--color-muted);
+}
+
+.action-form input {
+  display: block;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.action-form button {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-accent);
+  color: var(--color-bg);
+  font: inherit;
+  cursor: pointer;
+}
+
 /* Opportunity create form. */
 .opportunity-form {
   display: flex;

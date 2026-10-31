@@ -101,6 +101,41 @@
     {% if application.can_record_report %}
     <p><a href="/applications/{{ application.id }}/report">{% if application.has_report %}Update reporting status{% else %}Record reporting status{% endif %}</a></p>
     {% endif %}
+
+    <h4>Follow-ups</h4>
+    {% if application.actions.is_empty() %}
+    <p class="muted">No follow-ups recorded. Add one to remind yourself of a next step.</p>
+    {% endif %}
+    <ul class="action-list">
+      {% for action in application.actions %}
+      <li>
+        <strong>{{ action.title }}</strong>{% match action.due_display %}{% when Some with (due) %} · {{ due }}{% when None %}{% endmatch %}{% match action.completed_display %}{% when Some with (done) %} · {{ done }}{% when None %}{% endmatch %}
+        {% match action.notes_display %}
+        {% when Some with (note) %}
+        <br>{{ note }}
+        {% when None %}
+        {% endmatch %}
+        {% if action.is_open %}
+        <form method="post" action="/actions/{{ action.id }}/complete">
+          <button type="submit">Mark done</button>
+        </form>
+        {% else %}
+        <form method="post" action="/actions/{{ action.id }}/reopen">
+          <button type="submit">Reopen</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/actions/{{ action.id }}/delete">
+          <button type="submit">Delete</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    <form class="action-form" method="post" action="/applications/{{ application.id }}/actions">
+      <label>Title <input type="text" name="title"></label>
+      <label>Due date <input type="date" name="due_at"></label>
+      <label>Notes <input type="text" name="notes"></label>
+      <button type="submit">Add follow-up</button>
+    </form>
     {% if application.is_withdrawn %}
     <p class="muted">This attempt is closed for good.</p>
     {% endif %}
