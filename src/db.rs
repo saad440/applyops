@@ -1108,6 +1108,150 @@ pub mod applications {
         tx.commit().await.map_err(StageTransitionError::Database)?;
         Ok(())
     }
+
+    /// Why an employer outcome could not be recorded.
+    #[derive(Debug)]
+    pub enum OutcomeError {
+        /// No application row with that id exists.
+        ApplicationMissing,
+        /// Employer outcomes exist only on submitted attempts: an
+        /// interview does not undo the submission, and a withdrawn
+        /// attempt receives no outcome.
+        NotSubmitted { stage: String },
+        /// The submitted input was rejected before any SQL ran.
+        Validation(SubmissionValidationError),
+        /// SQLite rejected the change, for example on a check constraint.
+        Database(sqlx::Error),
+    }
+
+    impl std::fmt::Display for OutcomeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ApplicationMissing => write!(f, "no such application"),
+                Self::NotSubmitted { stage } => write!(
+                    f,
+                    "an employer outcome requires a submitted application; this one is {stage}"
+                ),
+                Self::Validation(err) => write!(f, "{err}"),
+                Self::Database(err) => write!(f, "database error: {err}"),
+            }
+        }
+    }
+
+    impl std::error::Error for OutcomeError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Validation(err) => Some(err),
+                Self::Database(err) => Some(err),
+                _ => None,
+            }
+        }
+    }
+
+    /// Records or corrects the employer outcome of a submitted application.
+    /// Outcomes exist only on submitted attempts; choosing `unknown`
+    /// clears the outcome and its date. Corrections are allowed and keep
+    /// the previous value in the event history; the change and its event
+    /// are written in one transaction.
+    pub async fn record_employer_outcome(
+        pool: &SqlitePool,
+        application_id: i64,
+        employer_outcome: &str,
+        outcome_at: Option<&str>,
+    ) -> Result<(), OutcomeError> {
+        let trimmed_outcome = employer_outcome.trim();
+        if !EMPLOYER_OUTCOMES.contains(&trimmed_outcome) {
+            return Err(OutcomeError::Validation(SubmissionValidationError {
+                field: "employer_outcome",
+                reason: "is not a recognized value",
+            }));
+        }
+
+        // A concrete outcome carries the date it was learned; `unknown`
+        // clears both.
+        let trimmed_date = outcome_at.map(str::trim).filter(|date| !date.is_empty());
+        if trimmed_outcome != "unknown" {
+            match trimmed_date {
+                None => {
+                    return Err(OutcomeError::Validation(SubmissionValidationError {
+                        field: "outcome_at",
+                        reason: "must not be empty",
+                    }));
+                }
+                Some(date) if !super::opportunities::is_iso_date(date) => {
+                    return Err(OutcomeError::Validation(SubmissionValidationError {
+                        field: "outcome_at",
+                        reason: "must be a calendar date formatted YYYY-MM-DD",
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let mut tx = pool.begin().await.map_err(OutcomeError::Database)?;
+        let Some((id, user_id, stage, previous)): Option<(i64, i64, String, String)> =
+            sqlx::query_as(
+                "SELECT id, user_id, stage, employer_outcome FROM applications WHERE id = ?",
+            )
+            .bind(application_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(OutcomeError::Database)?
+        else {
+            return Err(OutcomeError::ApplicationMissing);
+        };
+        if stage != "submitted" {
+            return Err(OutcomeError::NotSubmitted { stage });
+        }
+
+        let cleared = trimmed_outcome == "unknown";
+        if cleared {
+            sqlx::query(
+                "UPDATE applications \
+                 SET employer_outcome = 'unknown', outcome_at = NULL \
+                 WHERE id = ? AND stage = 'submitted'",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(OutcomeError::Database)?;
+        } else {
+            sqlx::query(
+                "UPDATE applications \
+                 SET employer_outcome = ?, outcome_at = ? \
+                 WHERE id = ? AND stage = 'submitted'",
+            )
+            .bind(trimmed_outcome)
+            .bind(trimmed_date)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(OutcomeError::Database)?;
+        }
+
+        let note = if cleared {
+            "outcome cleared".to_string()
+        } else {
+            format!("outcome_at={}", trimmed_date.unwrap_or_default())
+        };
+        super::application_events::insert_event(
+            &mut tx,
+            super::application_events::NewEvent {
+                user_id,
+                event_type: super::application_events::EVENT_OUTCOME_CHANGED,
+                entity_type: "application",
+                entity_id: id,
+                old_value: Some(&previous),
+                new_value: Some(trimmed_outcome),
+                note: Some(&note),
+            },
+        )
+        .await
+        .map_err(OutcomeError::Database)?;
+
+        tx.commit().await.map_err(OutcomeError::Database)?;
+        Ok(())
+    }
 }
 
 /// Append-only event history for the key moments in an application's life.
@@ -1123,6 +1267,8 @@ pub mod application_events {
     pub const EVENT_SUBMISSION_CORRECTED: &str = "application_submission_corrected";
     /// A submitted application was genuinely retracted.
     pub const EVENT_WITHDRAWN: &str = "application_withdrawn";
+    /// An employer outcome was recorded or changed on a submitted attempt.
+    pub const EVENT_OUTCOME_CHANGED: &str = "employer_outcome_changed";
 
     /// One key moment as read from `application_events`.
     #[derive(Debug)]

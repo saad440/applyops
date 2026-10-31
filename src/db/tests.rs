@@ -762,3 +762,192 @@ async fn missing_applications_report_application_missing() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn employer_outcome_is_recorded_with_date_and_event() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+
+    applications::record_employer_outcome(&pool, id, "interview", Some("2026-10-25"))
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+    assert_eq!(stored.employer_outcome, "interview");
+    assert_eq!(stored.outcome_at.as_deref(), Some("2026-10-25"));
+
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events[0].event_type,
+        application_events::EVENT_OUTCOME_CHANGED
+    );
+    assert_eq!(events[0].old_value.as_deref(), Some("unknown"));
+    assert_eq!(events[0].new_value.as_deref(), Some("interview"));
+    assert_eq!(events[0].note.as_deref(), Some("outcome_at=2026-10-25"));
+}
+
+#[tokio::test]
+async fn employer_outcome_requires_a_submitted_attempt() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+
+    let err = applications::record_employer_outcome(&pool, id, "interview", Some("2026-10-25"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::OutcomeError::NotSubmitted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn employer_outcome_validation_rejects_bad_values_and_dates() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+
+    let err = applications::record_employer_outcome(&pool, id, "hired", Some("2026-10-25"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::OutcomeError::Validation(applications::SubmissionValidationError {
+            field: "employer_outcome",
+            ..
+        })
+    ));
+
+    let err = applications::record_employer_outcome(&pool, id, "offer", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::OutcomeError::Validation(applications::SubmissionValidationError {
+            field: "outcome_at",
+            ..
+        })
+    ));
+
+    let err = applications::record_employer_outcome(&pool, id, "offer", Some("19.10.2027"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::OutcomeError::Validation(applications::SubmissionValidationError {
+            field: "outcome_at",
+            ..
+        })
+    ));
+
+    // Well-formed but impossible: the CHECK constraint rejects it.
+    let err = applications::record_employer_outcome(&pool, id, "offer", Some("2027-02-30"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, applications::OutcomeError::Database(_)));
+
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "unknown");
+}
+
+#[tokio::test]
+async fn clearing_the_outcome_with_unknown_removes_the_date() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    applications::record_employer_outcome(&pool, id, "rejected", Some("2026-10-25"))
+        .await
+        .unwrap();
+
+    applications::record_employer_outcome(&pool, id, "unknown", None)
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "unknown");
+    assert!(stored.outcome_at.is_none());
+
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].old_value.as_deref(), Some("rejected"));
+    assert_eq!(events[0].new_value.as_deref(), Some("unknown"));
+    assert_eq!(events[0].note.as_deref(), Some("outcome cleared"));
+}
+
+#[tokio::test]
+async fn outcome_corrections_append_events() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+
+    applications::record_employer_outcome(&pool, id, "pending", Some("2026-10-20"))
+        .await
+        .unwrap();
+    applications::record_employer_outcome(&pool, id, "offer", Some("2026-11-01"))
+        .await
+        .unwrap();
+
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].old_value.as_deref(), Some("pending"));
+    assert_eq!(events[0].new_value.as_deref(), Some("offer"));
+    assert_eq!(events[0].note.as_deref(), Some("outcome_at=2026-11-01"));
+}
+
+#[tokio::test]
+async fn missing_application_outcome_reports_application_missing() {
+    let pool = migrated_pool().await;
+    assert!(matches!(
+        applications::record_employer_outcome(&pool, 999, "offer", Some("2026-10-25")).await,
+        Err(applications::OutcomeError::ApplicationMissing)
+    ));
+}

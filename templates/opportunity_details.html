@@ -85,6 +85,9 @@
     <p><a href="/applications/{{ application.id }}/correct">Correct to draft</a>
     · <a href="/applications/{{ application.id }}/withdraw">Withdraw</a></p>
     {% endif %}
+    {% if application.can_record_outcome %}
+    <p><a href="/applications/{{ application.id }}/outcome">{% if application.has_outcome %}Update employer outcome{% else %}Record employer outcome{% endif %}</a></p>
+    {% endif %}
     {% if application.is_withdrawn %}
     <p class="muted">This attempt is closed for good.</p>
     {% endif %}

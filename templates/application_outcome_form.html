@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}Employer outcome — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Employer outcome</h1>
+  <p class="muted">{{ context_heading }} · outcomes exist only on submitted applications.</p>
+</header>
+
+{% match form_error %}
+{% when Some with (message) %}
+<p class="form-error">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+
+<form method="post" action="/applications/{{ application_id }}/outcome" class="opportunity-form">
+  <div class="field">
+    <label for="employer_outcome">Outcome</label>
+    <select id="employer_outcome" name="employer_outcome">
+      <option value="pending" {% if employer_outcome == "pending" %}selected{% endif %}>Pending</option>
+      <option value="interview" {% if employer_outcome == "interview" %}selected{% endif %}>Interview</option>
+      <option value="offer" {% if employer_outcome == "offer" %}selected{% endif %}>Offer</option>
+      <option value="rejected" {% if employer_outcome == "rejected" %}selected{% endif %}>Rejected</option>
+      <option value="withdrawn" {% if employer_outcome == "withdrawn" %}selected{% endif %}>Withdrawn by me</option>
+      <option value="unknown" {% if employer_outcome == "unknown" %}selected{% endif %}>Unknown — clear the outcome</option>
+    </select>
+    {% match outcome_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Outcome {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="outcome_at">Date learned</label>
+    <input id="outcome_at" name="outcome_at" type="date" value="{{ outcome_at }}">
+    <p class="hint">Required for every outcome except Unknown; choosing Unknown clears the outcome.</p>
+    {% match outcome_at_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Date {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <button type="submit">Save outcome</button>
+  <p><a href="/opportunities/{{ opportunity_id }}">Cancel and go back</a></p>
+</form>
+{% endblock %}

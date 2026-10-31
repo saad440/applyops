@@ -698,3 +698,141 @@ async fn missing_applications_return_not_found() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+// --- Employer outcome ---
+
+/// Fresh state with one submitted application (opportunity 1, attempt 1).
+async fn state_with_submitted_application() -> AppState {
+    let state = state_with_draft_application().await;
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+    assert_redirect(
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await,
+    );
+    state
+}
+
+#[tokio::test]
+async fn submitted_attempt_offers_the_outcome_form() {
+    let state = state_with_submitted_application().await;
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Record employer outcome"));
+
+    let response = outcome_form(State(state), Path(1)).await.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Employer outcome"));
+    assert!(body.contains("Pending"));
+    assert!(body.contains("Interview"));
+    assert!(body.contains("Unknown — clear the outcome"));
+}
+
+#[tokio::test]
+async fn recording_an_outcome_persists_facts_and_history() {
+    let state = state_with_submitted_application().await;
+    let pairs = vec![
+        ("employer_outcome".to_string(), "interview".to_string()),
+        ("outcome_at".to_string(), "2026-10-25".to_string()),
+    ];
+    let response = record_outcome(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Interview · 25 Oct 2026"));
+    assert!(body.contains("Update employer outcome"));
+    assert!(body.contains("Employer outcome changed"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "interview");
+    assert_eq!(stored.outcome_at.as_deref(), Some("2026-10-25"));
+}
+
+#[tokio::test]
+async fn outcome_without_a_date_is_reported_on_the_form() {
+    let state = state_with_submitted_application().await;
+    let pairs = vec![
+        ("employer_outcome".to_string(), "offer".to_string()),
+        ("outcome_at".to_string(), String::new()),
+    ];
+    let response = record_outcome(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("must not be empty"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "unknown");
+}
+
+#[tokio::test]
+async fn clearing_the_outcome_from_the_form() {
+    let state = state_with_submitted_application().await;
+    let pairs = vec![
+        ("employer_outcome".to_string(), "rejected".to_string()),
+        ("outcome_at".to_string(), "2026-10-25".to_string()),
+    ];
+    assert_redirect(record_outcome(State(state.clone()), Path(1), Form(pairs)).await);
+
+    let pairs = vec![
+        ("employer_outcome".to_string(), "unknown".to_string()),
+        ("outcome_at".to_string(), String::new()),
+    ];
+    let response = record_outcome(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "unknown");
+    assert!(stored.outcome_at.is_none());
+}
+
+#[tokio::test]
+async fn outcome_on_a_draft_attempt_is_rejected_with_feedback() {
+    let state = state_with_draft_application().await;
+    let pairs = vec![
+        ("employer_outcome".to_string(), "offer".to_string()),
+        ("outcome_at".to_string(), "2026-10-25".to_string()),
+    ];
+    let response = record_outcome(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("only a submitted application can receive an employer outcome"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.employer_outcome, "unknown");
+}
+
+#[tokio::test]
+async fn outcome_form_for_a_missing_application_404s() {
+    let state = test_state().await;
+    let response = outcome_form(State(state), Path(999)).await.into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

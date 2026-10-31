@@ -235,11 +235,24 @@ struct ApplicationAttemptVm {
     /// Whether the recorded channel is meaningful: only after a confirmed
     /// submission (or on a closed attempt) does the channel say anything.
     show_channel: bool,
+    /// Employer outcomes exist only on submitted attempts.
+    can_record_outcome: bool,
+    /// Whether a concrete outcome is recorded (anything but `unknown`).
+    has_outcome: bool,
 }
 
 impl ApplicationAttemptVm {
     fn from_application(application: &db::applications::Application) -> Self {
         let stage = application.stage.as_str();
+        let outcome_display = match application.outcome_at.as_deref() {
+            Some(date) if application.employer_outcome != "unknown" => format!(
+                "{} · {}",
+                display_label(&application.employer_outcome),
+                format_date_human(date)
+            ),
+            _ => display_label(&application.employer_outcome),
+        };
+
         Self {
             id: application.id,
             stage: stage.to_string(),
@@ -249,13 +262,15 @@ impl ApplicationAttemptVm {
                 .map(format_date_human)
                 .unwrap_or_else(|| "Not submitted yet".to_string()),
             channel_display: display_label(&application.submission_channel),
-            outcome_display: display_label(&application.employer_outcome),
+            outcome_display,
             can_prepare: stage == "draft",
             can_unprepare: stage == "preparing",
             can_submit: stage == "preparing",
             can_correct: stage == "submitted",
             is_withdrawn: stage == "withdrawn",
             show_channel: stage == "submitted" || stage == "withdrawn",
+            can_record_outcome: stage == "submitted",
+            has_outcome: application.employer_outcome != "unknown",
         }
     }
 }
@@ -273,6 +288,7 @@ impl ApplicationEventVm {
             db::application_events::EVENT_SUBMITTED => "Submission recorded",
             db::application_events::EVENT_SUBMISSION_CORRECTED => "Submission corrected",
             db::application_events::EVENT_WITHDRAWN => "Application withdrawn",
+            db::application_events::EVENT_OUTCOME_CHANGED => "Employer outcome changed",
             other => other,
         }
         .to_string();
@@ -338,6 +354,21 @@ struct TransitionConfirmTemplate {
     form_action: String,
     submit_label: String,
     back_href: String,
+}
+
+/// The form for recording or updating the employer outcome of a submitted
+/// application.
+#[derive(Template)]
+#[template(path = "application_outcome_form.html")]
+struct OutcomeFormTemplate {
+    application_id: i64,
+    opportunity_id: i64,
+    context_heading: String,
+    employer_outcome: String,
+    outcome_at: String,
+    outcome_error: Option<String>,
+    outcome_at_error: Option<String>,
+    form_error: Option<String>,
 }
 
 /// Formats an ISO `YYYY-MM-DD` date as e.g. `15 Jan 2027` for display.
@@ -569,6 +600,10 @@ async fn main() {
         .route(
             "/applications/{id}/withdraw",
             get(withdraw_application_form).post(withdraw_application),
+        )
+        .route(
+            "/applications/{id}/outcome",
+            get(outcome_form).post(record_outcome),
         )
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
@@ -1164,6 +1199,112 @@ async fn withdraw_application_form(State(state): State<AppState>, Path(id): Path
 /// submitted application.
 async fn withdraw_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     apply_stage_transition(&state, id, RequestedTransition::Withdraw).await
+}
+
+/// Builds the outcome form view model for one application, prefilled with
+/// the stored outcome.
+async fn outcome_form_template(
+    state: &AppState,
+    application: &db::applications::Application,
+) -> OutcomeFormTemplate {
+    let context_heading =
+        match db::opportunities::get_opportunity(&state.db, application.opportunity_id).await {
+            Ok(Some(opportunity)) => {
+                format!("{} — {}", opportunity.organization, opportunity.title)
+            }
+            Ok(None) | Err(_) => format!("Application attempt {}", application.id),
+        };
+
+    OutcomeFormTemplate {
+        application_id: application.id,
+        opportunity_id: application.opportunity_id,
+        context_heading,
+        employer_outcome: application.employer_outcome.clone(),
+        outcome_at: application.outcome_at.clone().unwrap_or_default(),
+        outcome_error: None,
+        outcome_at_error: None,
+        form_error: None,
+    }
+}
+
+/// `GET /applications/{id}/outcome` — the form for recording or updating
+/// the employer outcome.
+async fn outcome_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => {
+            HtmlTemplate(outcome_form_template(&state, &application).await).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `POST /applications/{id}/outcome` — validates and records the employer
+/// outcome. Invalid input re-renders the form with the entered values and
+/// field errors.
+async fn record_outcome(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let employer_outcome = form_field(&pairs, "employer_outcome");
+    let outcome_at = form_field(&pairs, "outcome_at");
+
+    let application = match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+        }
+    };
+
+    let mut template = outcome_form_template(&state, &application).await;
+    template.employer_outcome = employer_outcome.clone();
+    template.outcome_at = outcome_at.clone();
+
+    match db::applications::record_employer_outcome(
+        &state.db,
+        id,
+        &employer_outcome,
+        Some(&outcome_at),
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/opportunities/{}", application.opportunity_id))
+            .into_response(),
+        Err(db::applications::OutcomeError::Validation(err)) => {
+            let message = Some(err.reason.to_string());
+            match err.field {
+                "employer_outcome" => template.outcome_error = message,
+                "outcome_at" => template.outcome_at_error = message,
+                _ => template.form_error = Some(format!("{} {}", err.field, err.reason)),
+            }
+            HtmlTemplate(template).into_response()
+        }
+        Err(db::applications::OutcomeError::NotSubmitted { stage }) => {
+            render_opportunity_details(
+                &state,
+                application.opportunity_id,
+                Some(format!(
+                    "This application is currently {stage}; only a submitted application can receive an employer outcome."
+                )),
+            )
+            .await
+        }
+        Err(db::applications::OutcomeError::ApplicationMissing) => {
+            (StatusCode::NOT_FOUND, "No such application").into_response()
+        }
+        Err(db::applications::OutcomeError::Database(err)) => {
+            tracing::error!(%err, "failed to record employer outcome");
+            template.form_error =
+                Some("The outcome could not be stored. Please try again.".to_string());
+            HtmlTemplate(template).into_response()
+        }
+    }
 }
 
 /// `GET /healthz` — health check for scripted verification.
