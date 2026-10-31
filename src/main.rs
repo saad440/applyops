@@ -36,8 +36,8 @@ const DB_PATH_ENV: &str = "APPLYOPS_DB_PATH";
 /// Directory of local static assets, resolved relative to the working directory.
 const STATIC_DIR: &str = "static";
 
-/// Stand-in user id for the local single-user phase; a later milestone
-/// introduces real user management. The `user_id` column exists from the
+/// Stand-in user id for the local single-user phase; real user management
+/// is not implemented yet. The `user_id` column exists from the
 /// first migration so introducing accounts later does not require rewriting
 /// stored rows.
 const DEFAULT_USER_ID: i64 = 1;
@@ -146,8 +146,9 @@ impl OpportunityFormTemplate {
     }
 }
 
-/// Rendered details of one stored opportunity. Display labels are prepared
-/// here so the template stays free of formatting logic.
+/// Rendered details of one stored opportunity, including its application
+/// attempts and the recorded history. Display labels are prepared here so
+/// the template stays free of formatting logic.
 #[derive(Template)]
 #[template(path = "opportunity_details.html")]
 struct OpportunityDetailsTemplate {
@@ -161,15 +162,37 @@ struct OpportunityDetailsTemplate {
     notes: Option<String>,
     stage: String,
     created_at: String,
+    applications: Vec<ApplicationAttemptVm>,
+    /// Whether a draft or preparing attempt exists; controls the
+    /// start-application affordance on the page.
+    has_active_attempt: bool,
+    /// Label for the start-application button: first attempt or another one.
+    start_attempt_label: String,
+    events: Vec<ApplicationEventVm>,
+    /// Feedback for a rejected application transition, e.g. from a stale
+    /// page; shown above the application section.
+    application_form_error: Option<String>,
 }
 
 impl OpportunityDetailsTemplate {
-    fn from_opportunity(opportunity: &db::opportunities::Opportunity) -> Self {
+    fn from_opportunity(
+        opportunity: &db::opportunities::Opportunity,
+        applications: Vec<ApplicationAttemptVm>,
+        events: Vec<ApplicationEventVm>,
+        has_active_attempt: bool,
+    ) -> Self {
         let location_display = match (&opportunity.city, &opportunity.country) {
             (Some(city), Some(country)) => Some(format!("{city}, {country}")),
             (Some(place), None) | (None, Some(place)) => Some(place.clone()),
             (None, None) => None,
         };
+
+        let start_attempt_label = if applications.is_empty() {
+            "Start an application"
+        } else {
+            "Start another application"
+        }
+        .to_string();
 
         Self {
             opportunity_id: opportunity.id,
@@ -186,8 +209,135 @@ impl OpportunityDetailsTemplate {
             notes: opportunity.notes.clone(),
             stage: opportunity.stage.clone(),
             created_at: opportunity.created_at.clone(),
+            applications,
+            has_active_attempt,
+            start_attempt_label,
+            events,
+            application_form_error: None,
         }
     }
+}
+
+/// One application attempt as displayed on the opportunity details page,
+/// with display labels prepared here and flags telling the template which
+/// transitions are available in the current stage.
+struct ApplicationAttemptVm {
+    id: i64,
+    stage: String,
+    submitted_display: String,
+    channel_display: String,
+    outcome_display: String,
+    can_prepare: bool,
+    can_unprepare: bool,
+    can_submit: bool,
+    can_correct: bool,
+    is_withdrawn: bool,
+    /// Whether the recorded channel is meaningful: only after a confirmed
+    /// submission (or on a closed attempt) does the channel say anything.
+    show_channel: bool,
+}
+
+impl ApplicationAttemptVm {
+    fn from_application(application: &db::applications::Application) -> Self {
+        let stage = application.stage.as_str();
+        Self {
+            id: application.id,
+            stage: stage.to_string(),
+            submitted_display: application
+                .submitted_at
+                .as_deref()
+                .map(format_date_human)
+                .unwrap_or_else(|| "Not submitted yet".to_string()),
+            channel_display: display_label(&application.submission_channel),
+            outcome_display: display_label(&application.employer_outcome),
+            can_prepare: stage == "draft",
+            can_unprepare: stage == "preparing",
+            can_submit: stage == "preparing",
+            can_correct: stage == "submitted",
+            is_withdrawn: stage == "withdrawn",
+            show_channel: stage == "submitted" || stage == "withdrawn",
+        }
+    }
+}
+
+/// One recorded history entry as displayed on the details page.
+struct ApplicationEventVm {
+    event_label: String,
+    created_at: String,
+    detail: Option<String>,
+}
+
+impl ApplicationEventVm {
+    fn from_event(event: &db::application_events::ApplicationEvent) -> Self {
+        let event_label = match event.event_type.as_str() {
+            db::application_events::EVENT_SUBMITTED => "Submission recorded",
+            db::application_events::EVENT_SUBMISSION_CORRECTED => "Submission corrected",
+            db::application_events::EVENT_WITHDRAWN => "Application withdrawn",
+            other => other,
+        }
+        .to_string();
+        let detail = match (&event.old_value, &event.new_value, &event.note) {
+            (Some(old), Some(new), Some(note)) => Some(format!("{old} to {new}: {note}")),
+            (Some(old), Some(new), None) => Some(format!("{old} to {new}")),
+            _ => event.note.clone(),
+        };
+        Self {
+            event_label,
+            created_at: event.created_at.clone(),
+            detail,
+        }
+    }
+}
+
+/// Turns a stored code such as `employment_agency` into a readable label such
+/// as `Employment agency`; unknown codes pass through unchanged.
+fn display_label(code: &str) -> String {
+    const LABELS: [(&str, &str); 10] = [
+        ("email", "Email"),
+        ("employer_portal", "Employer portal"),
+        ("employment_agency", "Employment agency"),
+        ("other", "Other"),
+        ("unknown", "Unknown"),
+        ("pending", "Pending"),
+        ("interview", "Interview"),
+        ("offer", "Offer"),
+        ("rejected", "Rejected"),
+        ("withdrawn", "Withdrawn"),
+    ];
+
+    LABELS
+        .iter()
+        .find(|(stored, _)| *stored == code)
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
+/// The confirmation form for recording a submission with its date and
+/// channel; an application is submitted only through this explicit step.
+#[derive(Template)]
+#[template(path = "application_submit_form.html")]
+struct SubmissionFormTemplate {
+    application_id: i64,
+    opportunity_id: i64,
+    context_heading: String,
+    submitted_at: String,
+    submission_channel: String,
+    submitted_at_error: Option<String>,
+    channel_error: Option<String>,
+    form_error: Option<String>,
+}
+
+/// The confirmation page for a significant stage change (submission
+/// correction or withdrawal); the warning states the consequences.
+#[derive(Template)]
+#[template(path = "application_transition_confirm.html")]
+struct TransitionConfirmTemplate {
+    context_heading: String,
+    heading: String,
+    warning: String,
+    form_action: String,
+    submit_label: String,
+    back_href: String,
 }
 
 /// Formats an ISO `YYYY-MM-DD` date as e.g. `15 Jan 2027` for display.
@@ -405,6 +555,21 @@ async fn main() {
             "/opportunities/{id}/edit",
             get(edit_opportunity_form).post(update_opportunity),
         )
+        .route("/opportunities/{id}/applications", post(create_application))
+        .route("/applications/{id}/prepare", post(prepare_application))
+        .route("/applications/{id}/unprepare", post(unprepare_application))
+        .route(
+            "/applications/{id}/submit",
+            get(submit_application_form).post(record_application_submission),
+        )
+        .route(
+            "/applications/{id}/correct",
+            get(correct_application_form).post(correct_application),
+        )
+        .route(
+            "/applications/{id}/withdraw",
+            get(withdraw_application_form).post(withdraw_application),
+        )
         .nest_service("/static", ServeDir::new(STATIC_DIR))
         .with_state(AppState { db: pool })
         .layer(middleware::from_fn(log_requests));
@@ -565,18 +730,78 @@ async fn create_opportunity(
     }
 }
 
-/// `GET /opportunities/{id}` — details of one stored opportunity.
+/// `GET /opportunities/{id}` — details of one stored opportunity, its
+/// application attempts, and the recorded history.
 async fn opportunity_details(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    match db::opportunities::get_opportunity(&state.db, id).await {
-        Ok(Some(opportunity)) => {
-            HtmlTemplate(OpportunityDetailsTemplate::from_opportunity(&opportunity)).into_response()
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "No such opportunity").into_response(),
+    render_opportunity_details(&state, id, None).await
+}
+
+/// Loads one opportunity with its attempts and history and renders the
+/// details page, optionally showing a message about a rejected application
+/// transition.
+async fn render_opportunity_details(
+    state: &AppState,
+    opportunity_id: i64,
+    application_form_error: Option<String>,
+) -> Response {
+    let opportunity = match db::opportunities::get_opportunity(&state.db, opportunity_id).await {
+        Ok(Some(opportunity)) => opportunity,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such opportunity").into_response(),
         Err(err) => {
             tracing::error!(%err, "failed to load opportunity");
-            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
         }
-    }
+    };
+
+    let applications = match db::applications::list_applications_for_opportunity(
+        &state.db,
+        opportunity_id,
+    )
+    .await
+    {
+        Ok(applications) => applications,
+        Err(err) => {
+            tracing::error!(%err, "failed to load applications");
+            Vec::new()
+        }
+    };
+    let attempts: Vec<ApplicationAttemptVm> = applications
+        .iter()
+        .map(ApplicationAttemptVm::from_application)
+        .collect();
+
+    let has_active_attempt =
+        match db::applications::active_application_for_opportunity(&state.db, opportunity_id).await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                tracing::error!(%err, "failed to load the active application");
+                false
+            }
+        };
+
+    let events =
+        match db::application_events::list_events_for_opportunity(&state.db, opportunity_id, 20)
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::error!(%err, "failed to load event history");
+                Vec::new()
+            }
+        };
+    let event_views: Vec<ApplicationEventVm> =
+        events.iter().map(ApplicationEventVm::from_event).collect();
+
+    let mut template = OpportunityDetailsTemplate::from_opportunity(
+        &opportunity,
+        attempts,
+        event_views,
+        has_active_attempt,
+    );
+    template.application_form_error = application_form_error;
+    HtmlTemplate(template).into_response()
 }
 
 /// `GET /opportunities/{id}/edit` — the edit form pre-filled with the stored
@@ -639,6 +864,306 @@ async fn update_opportunity(
             HtmlTemplate(template).into_response()
         }
     }
+}
+
+/// `POST /opportunities/{id}/applications` — starts a draft application for
+/// the opportunity. Submitting the form again while an attempt is still
+/// active simply returns to the details page without creating a duplicate.
+async fn create_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::applications::insert_application(&state.db, DEFAULT_USER_ID, id).await {
+        Ok(_) | Err(db::applications::ApplicationInsertError::ActiveAttemptExists) => {
+            Redirect::to(&format!("/opportunities/{id}")).into_response()
+        }
+        Err(db::applications::ApplicationInsertError::OpportunityMissing) => {
+            (StatusCode::NOT_FOUND, "No such opportunity").into_response()
+        }
+        Err(db::applications::ApplicationInsertError::Database(err)) => {
+            tracing::error!(%err, "failed to store application");
+            render_opportunity_details(
+                &state,
+                id,
+                Some("The application could not be stored. Please try again.".to_string()),
+            )
+            .await
+        }
+    }
+}
+
+/// The stage changes a details-page button can request.
+enum RequestedTransition {
+    Prepare,
+    Unprepare,
+    CorrectToDraft,
+    Withdraw,
+}
+
+/// Applies a requested stage change and renders the outcome: a redirect to
+/// the opportunity details page on success, a 404 for a missing attempt,
+/// or the details page with an explanatory message when the transition no
+/// longer applies.
+async fn apply_stage_transition(
+    state: &AppState,
+    application_id: i64,
+    requested: RequestedTransition,
+) -> Response {
+    let application = match db::applications::get_application(&state.db, application_id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+        }
+    };
+
+    let result = match requested {
+        RequestedTransition::Prepare => {
+            db::applications::set_in_progress_stage(&state.db, application_id, "preparing").await
+        }
+        RequestedTransition::Unprepare => {
+            db::applications::set_in_progress_stage(&state.db, application_id, "draft").await
+        }
+        RequestedTransition::CorrectToDraft => {
+            db::applications::correct_submission_to_draft(&state.db, application_id).await
+        }
+        RequestedTransition::Withdraw => {
+            db::applications::withdraw(&state.db, application_id).await
+        }
+    };
+
+    match result {
+        Ok(()) => Redirect::to(&format!("/opportunities/{}", application.opportunity_id))
+            .into_response(),
+        Err(db::applications::StageTransitionError::ApplicationMissing) => {
+            (StatusCode::NOT_FOUND, "No such application").into_response()
+        }
+        Err(db::applications::StageTransitionError::InvalidTransition { from, to }) => {
+            render_opportunity_details(
+                state,
+                application.opportunity_id,
+                Some(format!(
+                    "This application is currently {from}; the requested change to {to} does not apply. Reload the page and retry."
+                )),
+            )
+            .await
+        }
+        Err(db::applications::StageTransitionError::Database(err)) => {
+            tracing::error!(%err, "failed to apply application transition");
+            render_opportunity_details(
+                state,
+                application.opportunity_id,
+                Some("The change could not be stored. Please try again.".to_string()),
+            )
+            .await
+        }
+    }
+}
+
+/// `POST /applications/{id}/prepare` — moves a draft attempt to preparing.
+async fn prepare_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    apply_stage_transition(&state, id, RequestedTransition::Prepare).await
+}
+
+/// `POST /applications/{id}/unprepare` — moves a preparing attempt back to
+/// draft.
+async fn unprepare_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    apply_stage_transition(&state, id, RequestedTransition::Unprepare).await
+}
+
+/// Reads one named, trimmed field from raw form pairs.
+fn form_field(pairs: &[(String, String)], name: &str) -> String {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Builds the submission form view model for one application, with the
+/// organization and title of the parent opportunity for context.
+async fn submission_form_template(
+    state: &AppState,
+    application: &db::applications::Application,
+) -> SubmissionFormTemplate {
+    let context_heading =
+        match db::opportunities::get_opportunity(&state.db, application.opportunity_id).await {
+            Ok(Some(opportunity)) => {
+                format!("{} — {}", opportunity.organization, opportunity.title)
+            }
+            Ok(None) | Err(_) => format!("Application attempt {}", application.id),
+        };
+
+    SubmissionFormTemplate {
+        application_id: application.id,
+        opportunity_id: application.opportunity_id,
+        context_heading,
+        submitted_at: String::new(),
+        submission_channel: "email".to_string(),
+        submitted_at_error: None,
+        channel_error: None,
+        form_error: None,
+    }
+}
+
+/// `GET /applications/{id}/submit` — the confirmation form for recording a
+/// submission with its date and channel.
+async fn submit_application_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => {
+            HtmlTemplate(submission_form_template(&state, &application).await).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `POST /applications/{id}/submit` — validates the confirmed submission
+/// facts and records them. Invalid input re-renders the form with the
+/// entered values and field errors.
+async fn record_application_submission(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let submitted_at = form_field(&pairs, "submitted_at");
+    let submission_channel = form_field(&pairs, "submission_channel");
+
+    let application = match db::applications::get_application(&state.db, id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response();
+        }
+    };
+
+    let mut template = submission_form_template(&state, &application).await;
+    template.submitted_at = submitted_at.clone();
+    template.submission_channel = submission_channel.clone();
+
+    match db::applications::record_submission(&state.db, id, &submitted_at, &submission_channel)
+        .await
+    {
+        Ok(()) => Redirect::to(&format!("/opportunities/{}", application.opportunity_id))
+            .into_response(),
+        Err(db::applications::SubmissionError::Validation(err)) => {
+            let message = Some(err.reason.to_string());
+            match err.field {
+                "submitted_at" => template.submitted_at_error = message,
+                "submission_channel" => template.channel_error = message,
+                _ => template.form_error = Some(format!("{} {}", err.field, err.reason)),
+            }
+            HtmlTemplate(template).into_response()
+        }
+        Err(db::applications::SubmissionError::InvalidTransition { from, .. }) => {
+            render_opportunity_details(
+                &state,
+                application.opportunity_id,
+                Some(format!(
+                    "This application is currently {from}; only an application that is preparing can be recorded as submitted."
+                )),
+            )
+            .await
+        }
+        Err(db::applications::SubmissionError::ApplicationMissing) => {
+            (StatusCode::NOT_FOUND, "No such application").into_response()
+        }
+        Err(db::applications::SubmissionError::Database(err)) => {
+            tracing::error!(%err, "failed to record submission");
+            template.form_error =
+                Some("The submission could not be stored. Please try again.".to_string());
+            HtmlTemplate(template).into_response()
+        }
+    }
+}
+
+/// The fixed text of one of the confirmation pages.
+struct TransitionConfirmText {
+    heading: &'static str,
+    warning: &'static str,
+    action_suffix: &'static str,
+    submit_label: &'static str,
+}
+
+/// Renders the confirmation page for a significant stage change.
+async fn transition_confirm_form(
+    state: &AppState,
+    application_id: i64,
+    text: TransitionConfirmText,
+) -> Response {
+    match db::applications::get_application(&state.db, application_id).await {
+        Ok(Some(application)) => {
+            let context_heading =
+                match db::opportunities::get_opportunity(&state.db, application.opportunity_id)
+                    .await
+                {
+                    Ok(Some(opportunity)) => {
+                        format!("{} — {}", opportunity.organization, opportunity.title)
+                    }
+                    Ok(None) | Err(_) => format!("Application attempt {application_id}"),
+                };
+            HtmlTemplate(TransitionConfirmTemplate {
+                context_heading,
+                heading: text.heading.to_string(),
+                warning: text.warning.to_string(),
+                form_action: format!("/applications/{application_id}/{}", text.action_suffix),
+                submit_label: text.submit_label.to_string(),
+                back_href: format!("/opportunities/{}", application.opportunity_id),
+            })
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "No such application").into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load application");
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+        }
+    }
+}
+
+/// `GET /applications/{id}/correct` — the confirmation page for correcting
+/// a mistakenly recorded submission back to draft.
+async fn correct_application_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    transition_confirm_form(
+        &state,
+        id,
+        TransitionConfirmText {
+            heading: "Correct the recorded submission",
+            warning: "This clears the recorded submission date and channel and resets the employer outcome to unknown. The submission itself stays in the history: the correction is recorded, not erased.",
+            action_suffix: "correct",
+            submit_label: "Correct to draft",
+        },
+    )
+    .await
+}
+
+/// `POST /applications/{id}/correct` — applies the submitted-to-draft
+/// correction.
+async fn correct_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    apply_stage_transition(&state, id, RequestedTransition::CorrectToDraft).await
+}
+
+/// `GET /applications/{id}/withdraw` — the confirmation page for
+/// withdrawing a submitted application.
+async fn withdraw_application_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    transition_confirm_form(
+        &state,
+        id,
+        TransitionConfirmText {
+            heading: "Withdraw the application",
+            warning: "Marks this attempt as withdrawn. A withdrawn attempt is closed for good; applying again starts a new attempt.",
+            action_suffix: "withdraw",
+            submit_label: "Withdraw application",
+        },
+    )
+    .await
+}
+
+/// `POST /applications/{id}/withdraw` — records the retraction of a
+/// submitted application.
+async fn withdraw_application(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    apply_stage_transition(&state, id, RequestedTransition::Withdraw).await
 }
 
 /// `GET /healthz` — health check for scripted verification.

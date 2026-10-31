@@ -193,8 +193,9 @@ pub mod opportunities {
 
     /// Checks that a value is a plain `YYYY-MM-DD` calendar date. The month
     /// and day ranges are checked here; full calendar validity is additionally
-    /// enforced by a CHECK constraint on the column itself.
-    fn is_iso_date(value: &str) -> bool {
+    /// enforced by a CHECK constraint on the column itself. Shared with the
+    /// applications module for the confirmed submission date.
+    pub(super) fn is_iso_date(value: &str) -> bool {
         let bytes = value.as_bytes();
         if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
             return false;
@@ -567,6 +568,658 @@ pub mod streams {
             inserted += 1;
         }
         Ok(inserted)
+    }
+}
+
+/// Application persistence: attempts per opportunity, their stages, the
+/// confirmed submission facts, and the stage transition rules. An
+/// opportunity may carry several attempts over time, but never two active
+/// ones. Submission, submission corrections, and withdrawal are recorded
+/// in the event history; in-progress corrections between draft and
+/// preparing are not.
+pub mod applications {
+    use super::*;
+    use sqlx::SqliteConnection;
+
+    /// Application stages of the submission workflow. Movement between the
+    /// stages is governed by the transition rules, not this list; the list
+    /// exists for display labels.
+    #[allow(dead_code)]
+    pub const STAGES: [&str; 4] = ["draft", "preparing", "submitted", "withdrawn"];
+
+    /// Channels through which an application can be sent.
+    pub const SUBMISSION_CHANNELS: [&str; 5] = [
+        "email",
+        "employer_portal",
+        "employment_agency",
+        "other",
+        "unknown",
+    ];
+
+    /// Employer outcomes, tracked independently of the stage. The outcome
+    /// controls are not implemented yet.
+    #[allow(dead_code)]
+    pub const EMPLOYER_OUTCOMES: [&str; 6] = [
+        "unknown",
+        "pending",
+        "interview",
+        "offer",
+        "rejected",
+        "withdrawn",
+    ];
+
+    /// A stored application attempt as read from the `applications` table.
+    #[derive(Debug)]
+    pub struct Application {
+        pub id: i64,
+        /// Not displayed anywhere yet; kept so user-scoped queries stay
+        /// possible without schema work. Read by the data-layer tests.
+        #[allow(dead_code)]
+        pub user_id: i64,
+        pub opportunity_id: i64,
+        pub stage: String,
+        /// Date-only calendar submission date (`YYYY-MM-DD`) or `None`
+        /// while the attempt is not submitted.
+        pub submitted_at: Option<String>,
+        pub submission_channel: String,
+        pub employer_outcome: String,
+        /// Date-only calendar date of the recorded employer outcome, or
+        /// `None` while the outcome is `unknown`. Read by the
+        /// employer-outcome controls.
+        #[allow(dead_code)]
+        pub outcome_at: Option<String>,
+        /// Not displayed anywhere yet; read by the data-layer tests.
+        #[allow(dead_code)]
+        pub created_at: String,
+    }
+
+    /// A single field-level validation failure on submission input.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct SubmissionValidationError {
+        pub field: &'static str,
+        pub reason: &'static str,
+    }
+
+    impl std::fmt::Display for SubmissionValidationError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "invalid {}: {}", self.field, self.reason)
+        }
+    }
+
+    impl std::error::Error for SubmissionValidationError {}
+
+    /// Why an application could not be created.
+    #[derive(Debug)]
+    pub enum ApplicationInsertError {
+        /// The opportunity does not exist.
+        OpportunityMissing,
+        /// The opportunity already has a draft or preparing attempt.
+        ActiveAttemptExists,
+        /// SQLite rejected the row, for example on a foreign-key constraint.
+        Database(sqlx::Error),
+    }
+
+    impl std::fmt::Display for ApplicationInsertError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::OpportunityMissing => write!(f, "no such opportunity"),
+                Self::ActiveAttemptExists => write!(f, "an active application already exists"),
+                Self::Database(err) => write!(f, "database error: {err}"),
+            }
+        }
+    }
+
+    impl std::error::Error for ApplicationInsertError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Database(err) => Some(err),
+                _ => None,
+            }
+        }
+    }
+
+    /// Why a stage transition could not be applied.
+    #[derive(Debug)]
+    pub enum StageTransitionError {
+        /// No application row with that id exists.
+        ApplicationMissing,
+        /// The current stage does not allow the requested transition.
+        InvalidTransition { from: String, to: String },
+        /// SQLite rejected the change, for example on a check constraint.
+        Database(sqlx::Error),
+    }
+
+    impl std::fmt::Display for StageTransitionError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ApplicationMissing => write!(f, "no such application"),
+                Self::InvalidTransition { from, to } => {
+                    write!(f, "cannot move an application from {from} to {to}")
+                }
+                Self::Database(err) => write!(f, "database error: {err}"),
+            }
+        }
+    }
+
+    impl std::error::Error for StageTransitionError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Database(err) => Some(err),
+                _ => None,
+            }
+        }
+    }
+
+    /// Why a submission could not be recorded.
+    #[derive(Debug)]
+    pub enum SubmissionError {
+        /// No application row with that id exists.
+        ApplicationMissing,
+        /// The current stage does not allow recording a submission; an
+        /// application reaches `submitted` only from `preparing`.
+        InvalidTransition { from: String, to: &'static str },
+        /// The submitted input was rejected before any SQL ran.
+        Validation(SubmissionValidationError),
+        /// SQLite rejected the change, for example on a check constraint.
+        Database(sqlx::Error),
+    }
+
+    impl std::fmt::Display for SubmissionError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ApplicationMissing => write!(f, "no such application"),
+                Self::InvalidTransition { from, to } => {
+                    write!(f, "cannot move an application from {from} to {to}")
+                }
+                Self::Validation(err) => write!(f, "{err}"),
+                Self::Database(err) => write!(f, "database error: {err}"),
+            }
+        }
+    }
+
+    impl std::error::Error for SubmissionError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Validation(err) => Some(err),
+                Self::Database(err) => Some(err),
+                _ => None,
+            }
+        }
+    }
+
+    /// Maps one `applications` row into an [`Application`].
+    fn application_from_row(row: &SqliteRow) -> Result<Application, sqlx::Error> {
+        Ok(Application {
+            id: row.try_get("id")?,
+            user_id: row.try_get("user_id")?,
+            opportunity_id: row.try_get("opportunity_id")?,
+            stage: row.try_get("stage")?,
+            submitted_at: row.try_get("submitted_at")?,
+            submission_channel: row.try_get("submission_channel")?,
+            employer_outcome: row.try_get("employer_outcome")?,
+            outcome_at: row.try_get("outcome_at")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    /// Reads the id and stage of one application inside a transaction, or
+    /// `None` when no such row exists.
+    async fn stage_of(
+        conn: &mut SqliteConnection,
+        application_id: i64,
+    ) -> Result<Option<(i64, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT id, stage FROM applications WHERE id = ?")
+            .bind(application_id)
+            .fetch_optional(conn)
+            .await
+    }
+
+    /// Creates a draft application for an opportunity and returns its id.
+    /// An opportunity may hold several attempts over time, but never two
+    /// active ones (draft or preparing), so repeated form submissions do
+    /// not create duplicate attempts.
+    pub async fn insert_application(
+        pool: &SqlitePool,
+        user_id: i64,
+        opportunity_id: i64,
+    ) -> Result<i64, ApplicationInsertError> {
+        let active = sqlx::query(
+            "SELECT id FROM applications \
+             WHERE opportunity_id = ? AND stage IN ('draft', 'preparing') LIMIT 1",
+        )
+        .bind(opportunity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(ApplicationInsertError::Database)?;
+        if active.is_some() {
+            return Err(ApplicationInsertError::ActiveAttemptExists);
+        }
+
+        let opportunity = sqlx::query("SELECT id FROM opportunities WHERE id = ?")
+            .bind(opportunity_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(ApplicationInsertError::Database)?;
+        if opportunity.is_none() {
+            return Err(ApplicationInsertError::OpportunityMissing);
+        }
+
+        sqlx::query_scalar(
+            "INSERT INTO applications (user_id, opportunity_id) VALUES (?, ?) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(opportunity_id)
+        .fetch_one(pool)
+        .await
+        .map_err(ApplicationInsertError::Database)
+    }
+
+    /// Fetches one application by id, or `None` when no such row exists.
+    pub async fn get_application(
+        pool: &SqlitePool,
+        id: i64,
+    ) -> Result<Option<Application>, sqlx::Error> {
+        sqlx::query(
+            "SELECT id, user_id, opportunity_id, stage, submitted_at, submission_channel, \
+             employer_outcome, outcome_at, created_at \
+             FROM applications WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(|row| application_from_row(&row))
+        .transpose()
+    }
+
+    /// Lists the attempts of one opportunity, newest first.
+    pub async fn list_applications_for_opportunity(
+        pool: &SqlitePool,
+        opportunity_id: i64,
+    ) -> Result<Vec<Application>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, opportunity_id, stage, submitted_at, submission_channel, \
+             employer_outcome, outcome_at, created_at \
+             FROM applications WHERE opportunity_id = ? ORDER BY id DESC",
+        )
+        .bind(opportunity_id)
+        .fetch_all(pool)
+        .await?;
+
+        rows.iter().map(application_from_row).collect()
+    }
+
+    /// Returns the active (draft or preparing) attempt of an opportunity,
+    /// if any.
+    pub async fn active_application_for_opportunity(
+        pool: &SqlitePool,
+        opportunity_id: i64,
+    ) -> Result<Option<Application>, sqlx::Error> {
+        sqlx::query(
+            "SELECT id, user_id, opportunity_id, stage, submitted_at, submission_channel, \
+             employer_outcome, outcome_at, created_at \
+             FROM applications \
+             WHERE opportunity_id = ? AND stage IN ('draft', 'preparing') \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(opportunity_id)
+        .fetch_optional(pool)
+        .await?
+        .map(|row| application_from_row(&row))
+        .transpose()
+    }
+
+    /// Moves a draft attempt to preparing, or a preparing attempt back to
+    /// draft. These in-progress corrections are not recorded in the event
+    /// history; only submission, submission corrections, and withdrawal are.
+    pub async fn set_in_progress_stage(
+        pool: &SqlitePool,
+        application_id: i64,
+        to_stage: &str,
+    ) -> Result<(), StageTransitionError> {
+        let mut tx = pool.begin().await.map_err(StageTransitionError::Database)?;
+        let Some((_, from)) = stage_of(&mut tx, application_id)
+            .await
+            .map_err(StageTransitionError::Database)?
+        else {
+            return Err(StageTransitionError::ApplicationMissing);
+        };
+
+        let allowed = (from == "draft" && to_stage == "preparing")
+            || (from == "preparing" && to_stage == "draft");
+        if !allowed {
+            return Err(StageTransitionError::InvalidTransition {
+                from,
+                to: to_stage.to_string(),
+            });
+        }
+
+        sqlx::query("UPDATE applications SET stage = ? WHERE id = ? AND stage = ?")
+            .bind(to_stage)
+            .bind(application_id)
+            .bind(&from)
+            .execute(&mut *tx)
+            .await
+            .map_err(StageTransitionError::Database)?;
+        tx.commit().await.map_err(StageTransitionError::Database)?;
+        Ok(())
+    }
+
+    /// Records a user-confirmed submission: channel and date-only calendar
+    /// date. An application reaches `submitted` only from `preparing`.
+    /// The stage change and the event are written in one
+    /// transaction so they succeed or fail together.
+    pub async fn record_submission(
+        pool: &SqlitePool,
+        application_id: i64,
+        submitted_at: &str,
+        submission_channel: &str,
+    ) -> Result<(), SubmissionError> {
+        let trimmed_date = submitted_at.trim();
+        if trimmed_date.is_empty() {
+            return Err(SubmissionError::Validation(SubmissionValidationError {
+                field: "submitted_at",
+                reason: "must not be empty",
+            }));
+        }
+        if !super::opportunities::is_iso_date(trimmed_date) {
+            return Err(SubmissionError::Validation(SubmissionValidationError {
+                field: "submitted_at",
+                reason: "must be a calendar date formatted YYYY-MM-DD",
+            }));
+        }
+        let trimmed_channel = submission_channel.trim();
+        if !SUBMISSION_CHANNELS.contains(&trimmed_channel) {
+            return Err(SubmissionError::Validation(SubmissionValidationError {
+                field: "submission_channel",
+                reason: "is not a recognized value",
+            }));
+        }
+
+        let mut tx = pool.begin().await.map_err(SubmissionError::Database)?;
+        let Some((id, user_id, from)) =
+            sqlx::query_as("SELECT id, user_id, stage FROM applications WHERE id = ?")
+                .bind(application_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(SubmissionError::Database)?
+        else {
+            return Err(SubmissionError::ApplicationMissing);
+        };
+        if from != "preparing" {
+            return Err(SubmissionError::InvalidTransition {
+                from,
+                to: "submitted",
+            });
+        }
+
+        sqlx::query(
+            "UPDATE applications \
+             SET stage = 'submitted', submitted_at = ?, submission_channel = ? \
+             WHERE id = ? AND stage = 'preparing'",
+        )
+        .bind(trimmed_date)
+        .bind(trimmed_channel)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(SubmissionError::Database)?;
+
+        super::application_events::insert_event(
+            &mut tx,
+            super::application_events::NewEvent {
+                user_id,
+                event_type: super::application_events::EVENT_SUBMITTED,
+                entity_type: "application",
+                entity_id: id,
+                old_value: Some("preparing"),
+                new_value: Some("submitted"),
+                note: Some(&format!(
+                    "submitted_at={trimmed_date} channel={trimmed_channel}"
+                )),
+            },
+        )
+        .await
+        .map_err(SubmissionError::Database)?;
+
+        tx.commit().await.map_err(SubmissionError::Database)?;
+        Ok(())
+    }
+
+    /// Corrects a mistakenly recorded submission back to `draft`:
+    /// clears the submission date and channel and resets the employer
+    /// outcome to `unknown`. The event log keeps the evidence of the
+    /// recorded submission, so the correction erases nothing. Once
+    /// reporting obligations are tracked, the correction is blocked
+    /// while any obligation is `pending` or `reported`.
+    pub async fn correct_submission_to_draft(
+        pool: &SqlitePool,
+        application_id: i64,
+    ) -> Result<(), StageTransitionError> {
+        let mut tx = pool.begin().await.map_err(StageTransitionError::Database)?;
+        let Some((id, user_id, from, submitted_at, channel, outcome)): Option<(
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, user_id, stage, submitted_at, submission_channel, employer_outcome \
+             FROM applications WHERE id = ?",
+        )
+        .bind(application_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StageTransitionError::Database)?
+        else {
+            return Err(StageTransitionError::ApplicationMissing);
+        };
+        if from != "submitted" {
+            return Err(StageTransitionError::InvalidTransition {
+                from,
+                to: "draft".to_string(),
+            });
+        }
+
+        sqlx::query(
+            "UPDATE applications \
+             SET stage = 'draft', submitted_at = NULL, submission_channel = 'unknown', \
+                 employer_outcome = 'unknown', outcome_at = NULL \
+             WHERE id = ? AND stage = 'submitted'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(StageTransitionError::Database)?;
+
+        let note = format!(
+            "submission cleared: submitted_at={} channel={}; employer_outcome={} reset to unknown",
+            submitted_at.unwrap_or_default(),
+            channel,
+            outcome,
+        );
+        super::application_events::insert_event(
+            &mut tx,
+            super::application_events::NewEvent {
+                user_id,
+                event_type: super::application_events::EVENT_SUBMISSION_CORRECTED,
+                entity_type: "application",
+                entity_id: id,
+                old_value: Some("submitted"),
+                new_value: Some("draft"),
+                note: Some(&note),
+            },
+        )
+        .await
+        .map_err(StageTransitionError::Database)?;
+
+        tx.commit().await.map_err(StageTransitionError::Database)?;
+        Ok(())
+    }
+
+    /// Records the genuine retraction of a submitted application.
+    /// `withdrawn` is reachable only from `submitted` and is terminal; a
+    /// re-application is a new attempt row.
+    pub async fn withdraw(
+        pool: &SqlitePool,
+        application_id: i64,
+    ) -> Result<(), StageTransitionError> {
+        let mut tx = pool.begin().await.map_err(StageTransitionError::Database)?;
+        let Some((id, user_id, from)) =
+            sqlx::query_as("SELECT id, user_id, stage FROM applications WHERE id = ?")
+                .bind(application_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(StageTransitionError::Database)?
+        else {
+            return Err(StageTransitionError::ApplicationMissing);
+        };
+        if from != "submitted" {
+            return Err(StageTransitionError::InvalidTransition {
+                from,
+                to: "withdrawn".to_string(),
+            });
+        }
+
+        sqlx::query(
+            "UPDATE applications SET stage = 'withdrawn' \
+             WHERE id = ? AND stage = 'submitted'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(StageTransitionError::Database)?;
+
+        super::application_events::insert_event(
+            &mut tx,
+            super::application_events::NewEvent {
+                user_id,
+                event_type: super::application_events::EVENT_WITHDRAWN,
+                entity_type: "application",
+                entity_id: id,
+                old_value: Some("submitted"),
+                new_value: Some("withdrawn"),
+                note: None,
+            },
+        )
+        .await
+        .map_err(StageTransitionError::Database)?;
+
+        tx.commit().await.map_err(StageTransitionError::Database)?;
+        Ok(())
+    }
+}
+
+/// Append-only event history for the key moments in an application's life.
+/// Rows are never updated or deleted; the trail starts when a change is recorded,
+/// with no backfilled events for records that predate the trail.
+pub mod application_events {
+    use super::*;
+    use sqlx::SqliteConnection;
+
+    /// A confirmed submission was recorded.
+    pub const EVENT_SUBMITTED: &str = "application_submitted";
+    /// A recorded submission was corrected back to `draft`.
+    pub const EVENT_SUBMISSION_CORRECTED: &str = "application_submission_corrected";
+    /// A submitted application was genuinely retracted.
+    pub const EVENT_WITHDRAWN: &str = "application_withdrawn";
+
+    /// One key moment as read from `application_events`.
+    #[derive(Debug)]
+    pub struct ApplicationEvent {
+        /// Not displayed anywhere yet; read by the data-layer tests.
+        #[allow(dead_code)]
+        pub id: i64,
+        /// Not displayed anywhere yet; kept so user-scoped queries stay
+        /// possible without schema work. Read by the data-layer tests.
+        #[allow(dead_code)]
+        pub user_id: i64,
+        pub event_type: String,
+        /// Not displayed anywhere yet; kept so entity-scoped queries stay
+        /// possible. Read by the data-layer tests.
+        #[allow(dead_code)]
+        pub entity_type: String,
+        /// The application (or, later, opportunity/obligation) the event
+        /// belongs to. Read by the data-layer tests.
+        #[allow(dead_code)]
+        pub entity_id: i64,
+        pub old_value: Option<String>,
+        pub new_value: Option<String>,
+        pub note: Option<String>,
+        pub created_at: String,
+    }
+
+    /// The fields of one event-history entry.
+    pub(super) struct NewEvent<'a> {
+        pub user_id: i64,
+        pub event_type: &'a str,
+        pub entity_type: &'a str,
+        pub entity_id: i64,
+        pub old_value: Option<&'a str>,
+        pub new_value: Option<&'a str>,
+        pub note: Option<&'a str>,
+    }
+
+    /// Inserts an event inside the caller's transaction. Old and new values
+    /// are sparse; the note carries the surrounding facts.
+    pub(super) async fn insert_event(
+        conn: &mut SqliteConnection,
+        event: NewEvent<'_>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO application_events \
+             (user_id, event_type, entity_type, entity_id, old_value, new_value, note) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.user_id)
+        .bind(event.event_type)
+        .bind(event.entity_type)
+        .bind(event.entity_id)
+        .bind(event.old_value)
+        .bind(event.new_value)
+        .bind(event.note)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Maps one `application_events` row into an [`ApplicationEvent`].
+    fn event_from_row(row: &SqliteRow) -> Result<ApplicationEvent, sqlx::Error> {
+        Ok(ApplicationEvent {
+            id: row.try_get("id")?,
+            user_id: row.try_get("user_id")?,
+            event_type: row.try_get("event_type")?,
+            entity_type: row.try_get("entity_type")?,
+            entity_id: row.try_get("entity_id")?,
+            old_value: row.try_get("old_value")?,
+            new_value: row.try_get("new_value")?,
+            note: row.try_get("note")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    /// Lists the events recorded for one opportunity's applications, newest
+    /// first. Events are joined through their application rows, so only
+    /// application-scoped events appear here.
+    pub async fn list_events_for_opportunity(
+        pool: &SqlitePool,
+        opportunity_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ApplicationEvent>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT e.id, e.user_id, e.event_type, e.entity_type, e.entity_id, \
+                    e.old_value, e.new_value, e.note, e.created_at \
+             FROM application_events e \
+             JOIN applications a ON a.id = e.entity_id \
+             WHERE e.entity_type = 'application' AND a.opportunity_id = ? \
+             ORDER BY e.id DESC LIMIT ?",
+        )
+        .bind(opportunity_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        rows.iter().map(event_from_row).collect()
     }
 }
 

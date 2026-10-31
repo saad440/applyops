@@ -398,3 +398,367 @@ async fn search_matches_fields_and_escapes_wildcards() {
     let hits = search_opportunities(&pool, "quantum", 10).await.unwrap();
     assert!(hits.is_empty());
 }
+
+// --- Applications: attempts, confirmed submissions, corrections ---
+
+use super::application_events;
+use super::applications;
+
+/// Inserts the sample opportunity and returns its id.
+async fn opportunity_id(pool: &SqlitePool) -> i64 {
+    insert_opportunity(pool, &sample_opportunity())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn application_starts_as_draft_with_defaults() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(stored.user_id, USER_ID);
+    assert_eq!(stored.opportunity_id, opportunity_id);
+    assert_eq!(stored.stage, "draft");
+    assert!(stored.submitted_at.is_none());
+    assert_eq!(stored.submission_channel, "unknown");
+    assert_eq!(stored.employer_outcome, "unknown");
+    assert!(stored.outcome_at.is_none());
+    assert!(
+        applications::active_application_for_opportunity(&pool, opportunity_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn application_requires_an_existing_opportunity() {
+    let pool = migrated_pool().await;
+    let err = applications::insert_application(&pool, USER_ID, 999)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::ApplicationInsertError::OpportunityMissing
+    ));
+}
+
+#[tokio::test]
+async fn only_one_active_attempt_per_opportunity() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+
+    applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    let err = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::ApplicationInsertError::ActiveAttemptExists
+    ));
+
+    // A second attempt becomes possible once the first one is withdrawn.
+    let first = applications::active_application_for_opportunity(&pool, opportunity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    applications::set_in_progress_stage(&pool, first.id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, first.id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    applications::withdraw(&pool, first.id).await.unwrap();
+    assert!(
+        applications::active_application_for_opportunity(&pool, opportunity_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        applications::list_applications_for_opportunity(&pool, opportunity_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn in_progress_transitions_follow_d017() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+
+    // draft -> preparing and back are legal in-progress corrections.
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    assert_eq!(
+        applications::get_application(&pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stage,
+        "preparing"
+    );
+    applications::set_in_progress_stage(&pool, id, "draft")
+        .await
+        .unwrap();
+
+    // `submitted` is reached only from `preparing`.
+    let err = applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::SubmissionError::InvalidTransition { .. }
+    ));
+
+    // An in-progress move may target only draft or preparing.
+    let err = applications::set_in_progress_stage(&pool, id, "submitted")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::StageTransitionError::InvalidTransition { .. }
+    ));
+
+    // In-progress corrections are not recorded in the event history.
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn submission_is_confirmed_with_date_and_channel() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+
+    applications::record_submission(&pool, id, "2026-10-19", "employment_agency")
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+    assert_eq!(stored.submitted_at.as_deref(), Some("2026-10-19"));
+    assert_eq!(stored.submission_channel, "employment_agency");
+
+    // The event history records the change with old and new values and the
+    // submission facts.
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, application_events::EVENT_SUBMITTED);
+    assert_eq!(events[0].entity_type, "application");
+    assert_eq!(events[0].entity_id, id);
+    assert_eq!(events[0].old_value.as_deref(), Some("preparing"));
+    assert_eq!(events[0].new_value.as_deref(), Some("submitted"));
+    let note = events[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("submitted_at=2026-10-19"));
+    assert!(note.contains("channel=employment_agency"));
+}
+
+#[tokio::test]
+async fn submission_validation_rejects_bad_dates_and_channels() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+
+    let err = applications::record_submission(&pool, id, "", "email")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::SubmissionError::Validation(applications::SubmissionValidationError {
+            field: "submitted_at",
+            ..
+        })
+    ));
+
+    let err = applications::record_submission(&pool, id, "19.01.2027", "email")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::SubmissionError::Validation(applications::SubmissionValidationError {
+            field: "submitted_at",
+            ..
+        })
+    ));
+
+    // Well-formed but impossible: code validation passes, the CHECK
+    // constraint on the column rejects it.
+    let err = applications::record_submission(&pool, id, "2027-02-30", "email")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, applications::SubmissionError::Database(_)));
+
+    let err = applications::record_submission(&pool, id, "2026-10-19", "carrier_pigeon")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::SubmissionError::Validation(applications::SubmissionValidationError {
+            field: "submission_channel",
+            ..
+        })
+    ));
+
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "preparing");
+}
+
+#[tokio::test]
+async fn correction_returns_to_draft_and_keeps_the_evidence() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-12", "employer_portal")
+        .await
+        .unwrap();
+
+    applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+    assert!(stored.submitted_at.is_none());
+    assert_eq!(stored.submission_channel, "unknown");
+    assert_eq!(stored.employer_outcome, "unknown");
+
+    // Both the recorded submission and the correction remain in the trail:
+    // the correction is recorded, not erased.
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].event_type,
+        application_events::EVENT_SUBMISSION_CORRECTED
+    );
+    assert_eq!(events[0].old_value.as_deref(), Some("submitted"));
+    assert_eq!(events[0].new_value.as_deref(), Some("draft"));
+    let note = events[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("submitted_at=2026-10-12"));
+    assert!(note.contains("reset to unknown"));
+
+    // A correction is only possible from `submitted`.
+    let err = applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::StageTransitionError::InvalidTransition { .. }
+    ));
+}
+
+#[tokio::test]
+async fn withdrawal_is_terminal_and_evented() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+
+    applications::withdraw(&pool, id).await.unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "withdrawn");
+
+    // Terminal: a withdrawn attempt cannot be withdrawn again or corrected.
+    let err = applications::withdraw(&pool, id).await.unwrap_err();
+    assert!(matches!(
+        err,
+        applications::StageTransitionError::InvalidTransition { .. }
+    ));
+    let err = applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        applications::StageTransitionError::InvalidTransition { .. }
+    ));
+
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(events[0].event_type, application_events::EVENT_WITHDRAWN);
+}
+
+#[tokio::test]
+async fn missing_applications_report_application_missing() {
+    let pool = migrated_pool().await;
+    assert!(matches!(
+        applications::set_in_progress_stage(&pool, 999, "preparing").await,
+        Err(applications::StageTransitionError::ApplicationMissing)
+    ));
+    assert!(matches!(
+        applications::record_submission(&pool, 999, "2026-10-19", "email").await,
+        Err(applications::SubmissionError::ApplicationMissing)
+    ));
+    assert!(matches!(
+        applications::correct_submission_to_draft(&pool, 999).await,
+        Err(applications::StageTransitionError::ApplicationMissing)
+    ));
+    assert!(matches!(
+        applications::withdraw(&pool, 999).await,
+        Err(applications::StageTransitionError::ApplicationMissing)
+    ));
+    assert!(
+        applications::get_application(&pool, 999)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

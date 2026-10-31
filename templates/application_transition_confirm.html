@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}{{ heading }} — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>{{ heading }}</h1>
+  <p class="muted">{{ context_heading }}</p>
+</header>
+
+<section class="card">
+  <p>{{ warning }}</p>
+  <form method="post" action="{{ form_action }}">
+    <button type="submit">{{ submit_label }}</button>
+  </form>
+  <p><a href="{{ back_href }}">Cancel and go back</a></p>
+</section>
+{% endblock %}

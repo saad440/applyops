@@ -39,6 +39,78 @@
   {% endmatch %}
 </section>
 
+<section class="card">
+  <h2>Application</h2>
+
+  {% match application_form_error %}
+  {% when Some with (message) %}
+  <p class="form-error">{{ message }}</p>
+  {% when None %}
+  {% endmatch %}
+
+  {% if applications.is_empty() %}
+  <p class="muted">No application yet. You can start one when you begin preparing a submission.</p>
+  {% endif %}
+
+  {% for application in applications %}
+  <article class="application-attempt">
+    <h3>Attempt · {{ application.stage }}</h3>
+    <dl class="details">
+      <dt>Submitted</dt>
+      <dd>{{ application.submitted_display }}</dd>
+
+      {% if application.show_channel %}
+      <dt>Channel</dt>
+      <dd>{{ application.channel_display }}</dd>
+      {% endif %}
+
+      <dt>Employer outcome</dt>
+      <dd>{{ application.outcome_display }}</dd>
+    </dl>
+
+    {% if application.can_prepare %}
+    <form method="post" action="/applications/{{ application.id }}/prepare">
+      <button type="submit">Mark as preparing</button>
+    </form>
+    {% endif %}
+    {% if application.can_unprepare %}
+    <form method="post" action="/applications/{{ application.id }}/unprepare">
+      <button type="submit">Back to draft</button>
+    </form>
+    {% endif %}
+    {% if application.can_submit %}
+    <p><a href="/applications/{{ application.id }}/submit">Record submission</a></p>
+    {% endif %}
+    {% if application.can_correct %}
+    <p><a href="/applications/{{ application.id }}/correct">Correct to draft</a>
+    · <a href="/applications/{{ application.id }}/withdraw">Withdraw</a></p>
+    {% endif %}
+    {% if application.is_withdrawn %}
+    <p class="muted">This attempt is closed for good.</p>
+    {% endif %}
+  </article>
+  {% endfor %}
+
+  {% if !has_active_attempt %}
+  <form method="post" action="/opportunities/{{ opportunity_id }}/applications">
+    <button type="submit">{{ start_attempt_label }}</button>
+  </form>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>History</h2>
+  {% if events.is_empty() %}
+  <p class="muted">Nothing recorded yet. Submissions, corrections, withdrawals, and other changes appear here.</p>
+  {% else %}
+  <ul class="history">
+    {% for event in events %}
+    <li><strong>{{ event.event_label }}</strong> · {{ event.created_at }}{% match event.detail %}{% when Some with (detail) %} — {{ detail }}{% when None %}{% endmatch %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
 <p>
   <a href="/opportunities/{{ opportunity_id }}/edit">Edit</a>
   · <a href="/">Back to the list</a>

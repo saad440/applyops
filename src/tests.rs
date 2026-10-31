@@ -22,6 +22,12 @@ async fn body_string(response: Response) -> String {
     String::from_utf8(body.to_vec()).unwrap()
 }
 
+/// Asserts that a flow step returned the redirect of the POST/redirect/GET
+/// baseline.
+fn assert_redirect(response: Response) {
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
 /// The form pairs for the fictional university position.
 fn university_pairs() -> Vec<(String, String)> {
     vec![
@@ -399,4 +405,296 @@ fn loopback_addresses_are_detected() {
 fn non_loopback_addresses_are_detected() {
     assert!(!is_loopback_addr("0.0.0.0:8080"));
     assert!(!is_loopback_addr("192.168.1.10:8080"));
+}
+
+// --- Application workflow ---
+
+/// Fresh state with one opportunity and one draft application for it; the
+/// ids on the empty database are deterministic (opportunity 1, attempt 1).
+async fn state_with_draft_application() -> AppState {
+    let state = test_state().await;
+    let response = create_opportunity(State(state.clone()), Form(university_pairs()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let response = create_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    state
+}
+
+/// The confirmed submission form pairs.
+fn submission_pairs() -> Vec<(String, String)> {
+    vec![
+        ("submitted_at".to_string(), "2026-10-19".to_string()),
+        (
+            "submission_channel".to_string(),
+            "employment_agency".to_string(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn details_page_shows_the_application_section() {
+    let state = test_state().await;
+    let response = create_opportunity(State(state.clone()), Form(university_pairs()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let response = opportunity_details(State(state), Path(1))
+        .await
+        .into_response();
+    let body = body_string(response).await;
+    assert!(body.contains("No application yet"));
+    assert!(body.contains("Start an application"));
+    assert!(body.contains("Nothing recorded yet"));
+}
+
+#[tokio::test]
+async fn starting_an_application_creates_a_draft() {
+    let state = state_with_draft_application().await;
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Attempt · draft"));
+    assert!(body.contains("Mark as preparing"));
+    assert!(body.contains("History"));
+
+    // A repeated submit does not create a duplicate attempt.
+    let response = create_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let attempts = db::applications::list_applications_for_opportunity(&state.db, 1)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn starting_an_application_for_a_missing_opportunity_404s() {
+    let state = test_state().await;
+    let response = create_application(State(state), Path(999))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn draft_moves_to_preparing_and_back() {
+    let state = state_with_draft_application().await;
+    let response = prepare_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Record submission"));
+    assert!(body.contains("Back to draft"));
+
+    assert_redirect(unprepare_application(State(state.clone()), Path(1)).await);
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+}
+
+#[tokio::test]
+async fn submission_flow_records_confirmed_facts_and_history() {
+    let state = state_with_draft_application().await;
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+
+    // The submission form is an explicit confirmation step.
+    let response = submit_application_form(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Record submission"));
+    assert!(body.contains("Employment agency"));
+
+    let response =
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await
+            .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION),
+        Some(&"/opportunities/1".parse().unwrap())
+    );
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("19 Oct 2026"));
+    assert!(body.contains("Employment agency"));
+    assert!(body.contains("Submission recorded"));
+    assert!(body.contains("Correct to draft"));
+    assert!(body.contains("Withdraw"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+    assert_eq!(stored.submitted_at.as_deref(), Some("2026-10-19"));
+    assert_eq!(stored.submission_channel, "employment_agency");
+}
+
+#[tokio::test]
+async fn submission_without_a_date_is_reported_on_the_form() {
+    let state = state_with_draft_application().await;
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+
+    let pairs = vec![
+        ("submitted_at".to_string(), String::new()),
+        ("submission_channel".to_string(), "email".to_string()),
+    ];
+    let response = record_application_submission(State(state.clone()), Path(1), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("must not be empty"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "preparing");
+}
+
+#[tokio::test]
+async fn submission_from_a_draft_attempt_is_rejected_with_feedback() {
+    let state = state_with_draft_application().await;
+    let response =
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await
+            .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("only an application that is preparing can be recorded as submitted"));
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+}
+
+#[tokio::test]
+async fn correction_clears_submission_and_keeps_history() {
+    let state = state_with_draft_application().await;
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+    let mut pairs = submission_pairs();
+    pairs[0] = ("submitted_at".to_string(), "2026-10-12".to_string());
+    pairs[1] = ("submission_channel".to_string(), "email".to_string());
+    assert_redirect(
+        record_application_submission(State(state.clone()), Path(1), Form(pairs)).await,
+    );
+
+    let response = correct_application_form(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Correct the recorded submission"));
+    assert!(body.contains("the correction is recorded, not erased"));
+
+    let response = correct_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = db::applications::get_application(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "draft");
+    assert!(stored.submitted_at.is_none());
+
+    // The history still shows the original submission next to the
+    // correction, including the cleared date.
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Submission corrected"));
+    assert!(body.contains("Submission recorded"));
+    assert!(body.contains("2026-10-12"));
+}
+
+#[tokio::test]
+async fn withdrawal_closes_the_attempt_and_allows_a_new_one() {
+    let state = state_with_draft_application().await;
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+    assert_redirect(
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await,
+    );
+
+    let response = withdraw_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("Attempt · withdrawn"));
+    assert!(body.contains("closed for good"));
+    assert!(body.contains("Start another application"));
+
+    // Starting a new attempt after withdrawal is possible.
+    let response = create_application(State(state.clone()), Path(1))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let attempts = db::applications::list_applications_for_opportunity(&state.db, 1)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].stage, "draft");
+    assert_eq!(attempts[1].stage, "withdrawn");
+}
+
+#[tokio::test]
+async fn missing_applications_return_not_found() {
+    let state = test_state().await;
+    let responses = vec![
+        submit_application_form(State(state.clone()), Path(999))
+            .await
+            .into_response(),
+        prepare_application(State(state.clone()), Path(999))
+            .await
+            .into_response(),
+        correct_application(State(state.clone()), Path(999))
+            .await
+            .into_response(),
+        withdraw_application(State(state), Path(999))
+            .await
+            .into_response(),
+    ];
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

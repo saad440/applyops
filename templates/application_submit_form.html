@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Record submission — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Record submission</h1>
+  <p class="muted">{{ context_heading }} · only a confirmed entry counts as submitted.</p>
+</header>
+
+{% match form_error %}
+{% when Some with (message) %}
+<p class="form-error">{{ message }}</p>
+{% when None %}
+{% endmatch %}
+
+<form method="post" action="/applications/{{ application_id }}/submit" class="opportunity-form">
+  <div class="field">
+    <label for="submitted_at">Submission date</label>
+    <input id="submitted_at" name="submitted_at" type="date" value="{{ submitted_at }}" required>
+    {% match submitted_at_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Submission date {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="submission_channel">Channel</label>
+    <select id="submission_channel" name="submission_channel">
+      <option value="email" {% if submission_channel == "email" %}selected{% endif %}>Email</option>
+      <option value="employer_portal" {% if submission_channel == "employer_portal" %}selected{% endif %}>Employer portal</option>
+      <option value="employment_agency" {% if submission_channel == "employment_agency" %}selected{% endif %}>Employment agency</option>
+      <option value="other" {% if submission_channel == "other" %}selected{% endif %}>Other</option>
+    </select>
+    {% match channel_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Channel {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <button type="submit">Record submission</button>
+  <p><a href="/opportunities/{{ opportunity_id }}">Cancel and go back</a></p>
+</form>
+{% endblock %}
