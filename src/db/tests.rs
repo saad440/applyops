@@ -797,6 +797,70 @@ async fn submission_is_confirmed_with_date_and_channel() {
 }
 
 #[tokio::test]
+async fn a_failing_event_insert_rolls_back_the_state_change() {
+    let pool = migrated_pool().await;
+    let opportunity_id = opportunity_id(&pool).await;
+    let id = applications::insert_application(&pool, USER_ID, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+
+    // A trigger forces every write to the event history to fail; the stage
+    // change and its event share one transaction, so the already-applied
+    // stage change must be rolled back with the failed event insert.
+    sqlx::query(
+        "CREATE TRIGGER force_event_failure BEFORE INSERT ON application_events \
+         BEGIN SELECT RAISE(ABORT, 'event write forced to fail'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, applications::SubmissionError::Database(_)));
+
+    sqlx::query("DROP TRIGGER force_event_failure")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Nothing landed: the attempt is still preparing with no submission
+    // facts, and the history holds no half-written event.
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "preparing");
+    assert!(stored.submitted_at.is_none());
+    let events = application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+
+    // With the write path intact again, the same submission succeeds and
+    // both halves land together.
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    let stored = applications::get_application(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.stage, "submitted");
+    assert_eq!(
+        application_events::list_events_for_opportunity(&pool, opportunity_id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn submission_validation_rejects_bad_dates_and_channels() {
     let pool = migrated_pool().await;
     let opportunity_id = opportunity_id(&pool).await;
