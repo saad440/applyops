@@ -63,5 +63,75 @@
 </div>
 {% endif %}
 
+<div class="constrained">
+{% if !focus.is_empty() || pending_reports > 0 %}
+<section class="dash-section">
+  <h2>Focus</h2>
+  <ul class="focus-list">
+    {% for entry in focus %}
+    <li>
+      <span class="focus-priority priority-{{ entry.priority_class }}">{{ entry.priority_class | upper }}</span>
+      <a href="/opportunities/{{ entry.opportunity_id }}">{{ entry.heading }}</a>
+      <span class="muted">{{ entry.stream }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if pending_reports > 0 %}
+  <p class="hint">{{ pending_reports }} submitted {% if pending_reports == 1 %}application{% else %}applications{% endif %} awaiting a report — <a href="/reports">open the report backlog</a>.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if !submitted_groups.is_empty() %}
+<section class="dash-section">
+  <h2>Submitted by stream</h2>
+  <div class="dash-columns">
+    {% for group in submitted_groups %}
+    <div class="dash-group">
+      <h3>{{ group.name }}</h3>
+      <ul>
+        {% for entry in group.entries %}
+        <li>
+          <a href="/opportunities/{{ entry.opportunity_id }}">{{ entry.heading }}</a>
+          <span class="muted">Submitted {{ entry.submitted_display }} · outcome: {{ entry.outcome_display }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if !report_items.is_empty() %}
+<section class="dash-section">
+  <h2>Reporting backlog</h2>
+  <p class="muted">{{ report_counts.pending }} pending · {{ report_counts.unknown }} unknown · <a href="/reports">full backlog</a></p>
+  <ul>
+    {% for item in report_items %}
+    <li>
+      <a href="/applications/{{ item.application_id }}/report">{{ item.heading }}</a>
+      <span class="muted">Submitted {{ item.submitted_display }} · {{ item.status_display }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if !leads.is_empty() %}
+<section class="dash-section">
+  <h2>Open-ended leads</h2>
+  <ul>
+    {% for lead in leads %}
+    <li>
+      <a href="/opportunities/{{ lead.opportunity_id }}">{{ lead.heading }}</a>
+      <span class="muted">{{ lead.stream }} · {{ lead.stage }}{% match lead.effort_display %}{% when Some with (effort) %} · effort {{ effort }}{% when None %}{% endmatch %}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+</div>
+
 <p class="footer-links constrained"><a href="/">Opportunity list</a> · <a href="/opportunities/new">Add an opportunity</a> · <a href="/reports">Report backlog</a> · <a href="/diagnostics">Diagnostics</a></p>
 {% endblock %}

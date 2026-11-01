@@ -470,6 +470,74 @@ a {
   overflow: hidden;
 }
 
+/* Dashboard: lower sections. Sections appear only when they have content,
+   so the page never shows empty scaffolding. */
+.dash-section {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.dash-section h2 {
+  font-size: 1.1rem;
+  margin-bottom: var(--space-2);
+}
+
+.dash-section ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dash-section li {
+  margin-bottom: var(--space-2);
+}
+
+.dash-section li .muted {
+  display: block;
+  font-size: 0.875rem;
+}
+
+.dash-columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.dash-group {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.dash-group h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 0.95rem;
+  color: var(--color-muted);
+}
+
+.focus-list li {
+  margin-bottom: var(--space-1);
+}
+
+.focus-priority {
+  font-weight: 600;
+  margin-right: var(--space-1);
+}
+
+/* Priority colors support the text label, which is what carries the
+   meaning; color alone never distinguishes entries. */
+.focus-priority.priority-p1 {
+  color: var(--color-priority-p1);
+}
+
+.focus-priority.priority-p2 {
+  color: var(--color-priority-p2);
+}
+
+.focus-priority.priority-p3 {
+  color: var(--color-priority-p3);
+}
+
 /* The stream chip only appears in the stacked narrow layout, where the
    column headers are gone and each card must say which stream it is. */
 .stream-chip {

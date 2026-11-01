@@ -2161,3 +2161,89 @@ async fn dashboard_follows_the_latest_attempt_out_of_and_back_into_the_view() {
         1
     );
 }
+
+#[tokio::test]
+async fn dashboard_submitted_lists_only_the_latest_submitted_attempts() {
+    let pool = migrated_pool().await;
+    let opportunity_id =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p1", "Alpha Institute").await;
+
+    let first = applications::insert_application(&pool, 1, opportunity_id)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, first, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, first, "2026-10-12", "email")
+        .await
+        .unwrap();
+    // A correction returns the opportunity to the actionable views and out
+    // of the submitted summary.
+    applications::correct_submission_to_draft(&pool, first)
+        .await
+        .unwrap();
+    assert!(
+        dashboard::submitted_latest(&pool, 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The corrected attempt is active again as a draft and simply goes
+    // through preparing once more; no second attempt is needed.
+    applications::set_in_progress_stage(&pool, first, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, first, "2026-10-19", "email")
+        .await
+        .unwrap();
+    let rows = dashboard::submitted_latest(&pool, 20).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].opportunity_id, opportunity_id);
+    assert_eq!(rows[0].submitted_at.as_deref(), Some("2026-10-19"));
+    assert_eq!(rows[0].employer_outcome, "unknown");
+
+    // Recording an outcome shows on the summary without changing stages.
+    applications::record_employer_outcome(&pool, first, "interview", Some("2026-11-02"))
+        .await
+        .unwrap();
+    let rows = dashboard::submitted_latest(&pool, 20).await.unwrap();
+    assert_eq!(rows[0].employer_outcome, "interview");
+    assert_eq!(rows[0].outcome_at.as_deref(), Some("2026-11-02"));
+}
+
+#[tokio::test]
+async fn dashboard_open_leads_lists_actionable_undated_opportunities() {
+    let pool = migrated_pool().await;
+    let lead = insert_dashboard_opportunity(&pool, None, "p2", "Alpha Institute").await;
+
+    // Dated opportunities belong to the timeline, not the leads.
+    insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p1", "Beta Institute").await;
+    // Archived leads are history, not actionable.
+    let mut archived = sample_opportunity();
+    archived.deadline_date = None;
+    archived.deadline_kind = None;
+    archived.deadline_confidence = None;
+    archived.stage = "archived".to_string();
+    insert_opportunity(&pool, &archived).await.unwrap();
+
+    // A submitted latest attempt removes the lead; a correction returns it.
+    let id = applications::insert_application(&pool, 1, lead)
+        .await
+        .unwrap();
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    assert!(dashboard::open_leads(&pool, 20).await.unwrap().is_empty());
+    applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap();
+
+    let rows = dashboard::open_leads(&pool, 20).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, lead);
+    assert!(rows[0].deadline_date.is_none());
+}

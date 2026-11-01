@@ -5,7 +5,7 @@ use super::*;
 
 use axum::extract::{Form, Path, Query, State};
 
-use crate::web::dashboard::{DeadlineEntryVm, assemble_timeline};
+use crate::web::dashboard::{DeadlineEntryVm, assemble_focus, assemble_timeline};
 use crate::web::display::{
     civil_from_days, countdown_label, days_from_civil, format_date_human, parse_iso_day_number,
 };
@@ -1516,6 +1516,74 @@ fn an_empty_timeline_has_no_columns_or_rows() {
     assert!(rows.is_empty());
 }
 
+#[test]
+fn the_focus_selects_overdue_and_high_priority_entries_deterministically() {
+    let as_of = days_from_civil(2026, 10, 19);
+    let mut overdue_p3 = stored_opportunity_with(Some("2026-10-15"));
+    overdue_p3.id = 1;
+    overdue_p3.priority = "p3".to_string();
+    let mut future_p1 = stored_opportunity_with(Some("2026-12-01"));
+    future_p1.id = 2;
+    future_p1.priority = "p1".to_string();
+    let mut future_p2 = stored_opportunity_with(Some("2026-11-01"));
+    future_p2.id = 3;
+    future_p2.priority = "p2".to_string();
+
+    let focus = assemble_focus(&[overdue_p3, future_p2, future_p1], as_of);
+    let ids: Vec<i64> = focus.iter().map(|entry| entry.opportunity_id).collect();
+    // Overdue first (query order), then the P1 entry; the future P2 entry
+    // stays out of the small deterministic set.
+    assert_eq!(ids, [1, 2]);
+}
+
+#[test]
+fn the_focus_is_capped_at_five_entries() {
+    let as_of = days_from_civil(2026, 10, 19);
+    let mut entries = Vec::new();
+    for id in 1..=7 {
+        let mut opportunity = stored_opportunity_with(Some("2026-10-15"));
+        opportunity.id = id;
+        entries.push(opportunity);
+    }
+    let focus = assemble_focus(&entries, as_of);
+    assert_eq!(focus.len(), 5);
+}
+
+#[tokio::test]
+async fn the_dashboard_shows_the_lower_sections_from_real_records() {
+    let state = test_state().await;
+
+    // An undated lead and a dated P1 opportunity.
+    let mut lead_pairs = university_pairs();
+    for pair in lead_pairs.iter_mut() {
+        match pair.0.as_str() {
+            "deadline_date" | "deadline_kind" | "deadline_confidence" => pair.1.clear(),
+            _ => {}
+        }
+    }
+    assert_redirect(create_opportunity(State(state.clone()), Form(lead_pairs)).await);
+    assert_redirect(create_opportunity(State(state.clone()), Form(university_pairs())).await);
+
+    // Confirm a submission for the dated opportunity; its attempt is
+    // application 1.
+    assert_redirect(create_application(State(state.clone()), Path(2)).await);
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+    assert_redirect(
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await,
+    );
+
+    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    assert!(body.contains("Focus"));
+    assert!(body.contains("Submitted by stream"));
+    assert!(body.contains("Submitted 19 Oct 2026 · outcome: Unknown"));
+    assert!(body.contains("Reporting backlog"));
+    assert!(body.contains("0 pending · 1 unknown"));
+    assert!(body.contains("/applications/1/report"));
+    assert!(body.contains("Open-ended leads"));
+    assert!(body.contains("discovered"));
+}
+
 #[tokio::test]
 async fn dashboard_lists_deadlines_and_moves_submitted_out() {
     let state = test_state().await;
@@ -1543,7 +1611,9 @@ async fn dashboard_lists_deadlines_and_moves_submitted_out() {
     );
 
     let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
-    assert!(!body.contains("Schneckenhausen"));
+    // The timeline is empty now; the entry moved to the submitted summary.
+    assert!(body.contains("No upcoming deadlines"));
+    assert!(body.contains("Submitted by stream"));
     let stored = db::opportunities::get_opportunity(&state.db, 1)
         .await
         .unwrap()
