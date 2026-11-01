@@ -148,15 +148,29 @@ pub fn parse_iso_day_number(iso_date: &str) -> Option<i64> {
     Some(days)
 }
 
-/// Today's day number on the UTC calendar. Deadlines are date-only and
-/// carry no timezone of their own, so the brief hour in which UTC and local
-/// calendar dates disagree after midnight is accepted for now.
-pub fn today_day_number() -> i64 {
-    SystemTime::now()
+/// The calendar day number of a moment in the given time zone: the day
+/// the dashboard's countdowns and urgency labels are measured against.
+/// Zone lookup and conversion are delegated to `jiff`; the calendar
+/// arithmetic stays in this module.
+pub fn day_number_in(moment_unix_seconds: i64, time_zone: &jiff::tz::TimeZone) -> i64 {
+    let zoned = jiff::Timestamp::from_second(moment_unix_seconds)
+        .expect("a moment within the supported range")
+        .to_zoned(time_zone.clone())
+        .date();
+    days_from_civil(
+        i32::from(zoned.year()),
+        u32::try_from(zoned.month()).unwrap_or_default(),
+        u32::try_from(zoned.day()).unwrap_or_default(),
+    )
+}
+
+/// Today's day number in the app's configured time zone.
+pub fn today_day_number_in(time_zone: &jiff::tz::TimeZone) -> i64 {
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-        .div_euclid(86_400)
+        .unwrap_or(0);
+    day_number_in(now, time_zone)
 }
 
 /// The countdown text for a deadline measured against the current day.

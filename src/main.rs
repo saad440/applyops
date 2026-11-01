@@ -34,6 +34,13 @@ const DEFAULT_DB_PATH: &str = "data/applyops.db";
 /// Environment variable that overrides the database file path.
 const DB_PATH_ENV: &str = "APPLYOPS_DB_PATH";
 
+/// Environment variable that overrides the display time zone, as an IANA
+/// name such as `Europe/Berlin`.
+const TIME_ZONE_ENV: &str = "APPLYOPS_TIME_ZONE";
+
+/// Default display time zone for countdowns and urgency labels.
+const DEFAULT_TIME_ZONE: &str = "Europe/Berlin";
+
 /// Directory of local static assets, resolved relative to the working directory.
 const STATIC_DIR: &str = "static";
 
@@ -60,10 +67,23 @@ fn is_loopback_addr(addr: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
+/// Resolves the display time zone from an optional environment value. An
+/// unloadable name — unknown identifier or missing system time zone
+/// database — falls back to UTC with a warning, keeping the app usable.
+fn resolve_time_zone(env_value: Option<String>) -> jiff::tz::TimeZone {
+    let name = env_value.unwrap_or_else(|| DEFAULT_TIME_ZONE.to_string());
+    jiff::tz::TimeZone::get(&name).unwrap_or_else(|err| {
+        tracing::warn!(time_zone = %name, %err, "could not load time zone; falling back to UTC");
+        jiff::tz::TimeZone::UTC
+    })
+}
+
 /// Shared application state handed to handlers.
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
+    /// The time zone countdowns and urgency labels are measured against.
+    time_zone: jiff::tz::TimeZone,
 }
 
 /// Wraps an Askama template so it can be returned directly from handlers.
@@ -139,6 +159,9 @@ async fn main() {
 
     tracing::info!(%db_path, "database ready");
 
+    let time_zone = resolve_time_zone(std::env::var(TIME_ZONE_ENV).ok());
+    tracing::info!("display time zone set");
+
     // Middleware applies to the routes registered before it.
     let app = Router::new()
         .route("/", get(web::root))
@@ -194,7 +217,10 @@ async fn main() {
         .route("/actions/{id}/reopen", post(web::reopen_application_action))
         .route("/actions/{id}/delete", post(web::delete_application_action))
         .nest_service("/static", ServeDir::new(STATIC_DIR))
-        .with_state(AppState { db: pool })
+        .with_state(AppState {
+            db: pool,
+            time_zone,
+        })
         .layer(middleware::from_fn(log_requests));
 
     let listener = TcpListener::bind(&bind_addr)

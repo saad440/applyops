@@ -11,7 +11,7 @@ use crate::{AppState, DEFAULT_USER_ID, HtmlTemplate, db};
 
 use super::display::{
     civil_from_days, countdown_label, display_label, format_date_human, format_deadline_detail,
-    format_fit, format_location, parse_iso_day_number, today_day_number,
+    format_fit, format_location, parse_iso_day_number, today_day_number_in,
 };
 
 /// Width of the fixed date gutter in the timeline grid, in rem. Wide
@@ -454,7 +454,7 @@ pub async fn dashboard(
     State(state): State<AppState>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
-    let as_of = today_day_number();
+    let as_of = today_day_number_in(&state.time_zone);
     let (year, month, day) = civil_from_days(as_of);
     let as_of_display = format_date_human(&format!("{year:04}-{month:02}-{day:02}"));
 

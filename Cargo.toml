@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 askama = "0.16"
+jiff = "0.2"
 axum = "0.8.9"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

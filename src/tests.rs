@@ -7,10 +7,12 @@ use axum::extract::{Form, Path, Query, State};
 
 use crate::web::dashboard::{DashboardFilters, DeadlineEntryVm, assemble_focus, assemble_timeline};
 use crate::web::display::{
-    civil_from_days, countdown_label, days_from_civil, format_date_human, parse_iso_day_number,
+    civil_from_days, countdown_label, day_number_in, days_from_civil, format_date_human,
+    parse_iso_day_number,
 };
 use crate::web::opportunities::OpportunityListTemplate;
 use crate::web::*;
+use jiff::tz::TimeZone;
 
 /// Application state over a fresh in-memory database with migrations and
 /// default streams, mirroring server startup.
@@ -27,7 +29,10 @@ async fn test_state() -> AppState {
     )
     .await
     .expect("default authorities seeded");
-    AppState { db: pool }
+    AppState {
+        db: pool,
+        time_zone: TimeZone::UTC,
+    }
 }
 
 /// Reads a response body as text.
@@ -1428,6 +1433,68 @@ fn iso_day_parsing_rejects_non_dates() {
     assert_eq!(parse_iso_day_number("2027-13-01"), None);
     assert_eq!(parse_iso_day_number(""), None);
     assert_eq!(parse_iso_day_number("15 Jan 2027"), None);
+}
+
+#[test]
+fn the_configured_zone_sets_the_day_number() {
+    // A POSIX string encodes the EU rule: standard CET-1, summer CEST from
+    // the last Sunday of March to the last Sunday of October. This is
+    // deterministic — no system time zone database involved.
+    let berlin = TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+    let instant = |year: i32, month: u32, day: u32, hour: i64| {
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600
+    };
+
+    // A late-October evening in summer time: Berlin is already on the next
+    // calendar day while UTC is not.
+    assert_eq!(
+        day_number_in(instant(2026, 10, 24, 22), &berlin),
+        days_from_civil(2026, 10, 25)
+    );
+    // Winter: Berlin flips to the new year at 23:00 UTC on 31 December.
+    assert_eq!(
+        day_number_in(instant(2026, 12, 31, 23), &berlin),
+        days_from_civil(2027, 1, 1)
+    );
+    // Summer noon: both calendars agree on the date.
+    assert_eq!(
+        day_number_in(instant(2026, 7, 15, 12), &berlin),
+        days_from_civil(2026, 7, 15)
+    );
+}
+
+#[test]
+fn a_fixed_offset_zone_keeps_a_constant_distance() {
+    // POSIX signs are inverted: UTC-3 means three hours ahead of UTC.
+    let ahead_three = TimeZone::posix("UTC-3").unwrap();
+    let late_evening = days_from_civil(2026, 12, 31) * 86_400 + 21 * 3_600;
+    assert_eq!(
+        day_number_in(late_evening, &ahead_three),
+        days_from_civil(2027, 1, 1)
+    );
+}
+
+#[test]
+fn the_default_time_zone_name_resolves() {
+    // The shipped default needs a system time zone database, which is a
+    // local file — the app stays functional without network access.
+    assert!(TimeZone::get(DEFAULT_TIME_ZONE).is_ok());
+
+    // An unknown name never resolves, which is what triggers the UTC
+    // fallback in the resolver.
+    assert!(TimeZone::get("Bogus/Zone").is_err());
+}
+
+#[test]
+fn the_resolver_falls_back_to_utc_for_unknown_names() {
+    let resolved = resolve_time_zone(Some("Bogus/Zone".to_string()));
+    // A moment whose local date differs between UTC and a zone east of it:
+    // if the resolver fell back to UTC, the day number matches UTC.
+    let moment = days_from_civil(2026, 10, 24) * 86_400 + 22 * 3_600;
+    assert_eq!(
+        day_number_in(moment, &resolved),
+        day_number_in(moment, &TimeZone::UTC)
+    );
 }
 
 #[test]

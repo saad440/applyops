@@ -39,6 +39,7 @@ Configuration is read from environment variables with safe local defaults:
 | --- | --- | --- |
 | `APPLYOPS_BIND_ADDR` | `127.0.0.1:8080` | Address the server listens on |
 | `APPLYOPS_DB_PATH` | `data/applyops.db` | SQLite database file |
+| `APPLYOPS_TIME_ZONE` | `Europe/Berlin` | IANA name of the time zone that countdowns and overdue labels are measured in (for example `Europe/Berlin`, `America/New_York`); an unresolvable name falls back to UTC |
 | `RUST_LOG` | `info` | Log filtering |
 
 ApplyOps in its current form is intended for local use and has no authentication. Avoid binding it to an interface that is reachable by others. A warning is logged if you do.
