@@ -104,6 +104,23 @@ pub mod opportunities {
     /// stored on the opportunity.
     pub const PRIORITIES: [&str; 3] = ["p1", "p2", "p3"];
 
+    /// Estimated preparation effort levels. An unrated opportunity stores
+    /// `None`, never a placeholder value.
+    pub const EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
+    /// Kinds a recorded deadline can have. `None` means no verified closing
+    /// date; a kind is stored only together with the date it describes.
+    pub const DEADLINE_KINDS: [&str; 4] = [
+        "hard_close",
+        "priority_review",
+        "first_review",
+        "soft_target",
+    ];
+
+    /// How reliably the recorded deadline is known. `None` means the claim
+    /// has not been assessed yet.
+    pub const DEADLINE_CONFIDENCES: [&str; 3] = ["verified", "unverified", "conflicting"];
+
     /// A stored opportunity as read from the `opportunities` table.
     #[derive(Debug)]
     pub struct Opportunity {
@@ -120,10 +137,32 @@ pub mod opportunities {
         pub city: Option<String>,
         pub country: Option<String>,
         pub priority: String,
+        /// Optional self-assessed fit as a range within 1 to 5; `None` on
+        /// both ends means the opportunity is unrated.
+        pub fit_min: Option<f64>,
+        pub fit_max: Option<f64>,
+        /// Estimated preparation effort, or `None` while not estimated.
+        pub effort: Option<String>,
+        /// One- or two-sentence summary of the strongest fit and the
+        /// biggest gap, or `None`.
+        pub rationale: Option<String>,
         /// Date-only calendar deadline in `YYYY-MM-DD` form, or `None` when
         /// genuinely unknown; no cutoff time is invented for it.
         pub deadline_date: Option<String>,
+        /// What the recorded deadline means, or `None` when there is no
+        /// deadline date to describe.
+        pub deadline_kind: Option<String>,
+        /// How reliably the deadline is known, or `None` while it has not
+        /// been assessed.
+        pub deadline_confidence: Option<String>,
+        /// The original advert or lead source; the external link shown for
+        /// the opportunity.
         pub source_url: Option<String>,
+        /// Fallback page of the employer for speculative leads without a
+        /// concrete advert.
+        pub recruitment_page_url: Option<String>,
+        /// Notes on how the source and its dates were verified.
+        pub source_notes: Option<String>,
         pub notes: Option<String>,
         pub stage: String,
         pub created_at: String,
@@ -142,8 +181,16 @@ pub mod opportunities {
         pub city: Option<String>,
         pub country: Option<String>,
         pub priority: String,
+        pub fit_min: Option<f64>,
+        pub fit_max: Option<f64>,
+        pub effort: Option<String>,
+        pub rationale: Option<String>,
         pub deadline_date: Option<String>,
+        pub deadline_kind: Option<String>,
+        pub deadline_confidence: Option<String>,
         pub source_url: Option<String>,
+        pub recruitment_page_url: Option<String>,
+        pub source_notes: Option<String>,
         pub notes: Option<String>,
         pub stage: String,
     }
@@ -226,10 +273,13 @@ pub mod opportunities {
 
     /// Validates user-supplied opportunity data. Required text must be
     /// non-empty after trimming; the stream is a user-defined label and is
-    /// only checked for emptiness, while priority and stage are validated
-    /// against their generic vocabularies. Optional fields stay optional, a
-    /// missing deadline is `None` never a placeholder date, and a recorded
-    /// source URL must be an http or https web address.
+    /// only checked for emptiness, while priority, stage, effort, deadline
+    /// kind, and deadline confidence are validated against their generic
+    /// vocabularies. Optional fields stay optional, a missing deadline is
+    /// `None` never a placeholder date, recorded URLs must be http or
+    /// https web addresses, the fit values must lie within 1 to 5 with the
+    /// minimum not above the maximum, and a deadline kind or confidence is
+    /// only accepted together with the deadline date it describes.
     pub fn validate_new_opportunity(
         new: &NewOpportunity,
     ) -> Result<(), OpportunityValidationError> {
@@ -271,6 +321,40 @@ pub mod opportunities {
         recognized_code(&new.priority, "priority", &PRIORITIES)?;
         recognized_code(&new.stage, "stage", &STAGES)?;
 
+        for (field, value) in [("fit_min", new.fit_min), ("fit_max", new.fit_max)] {
+            if let Some(value) = value
+                && !(1.0..=5.0).contains(&value)
+            {
+                return Err(OpportunityValidationError {
+                    field,
+                    reason: "must be a number between 1 and 5",
+                });
+            }
+        }
+        if let (Some(min), Some(max)) = (new.fit_min, new.fit_max)
+            && min > max
+        {
+            return Err(OpportunityValidationError {
+                field: "fit_max",
+                reason: "must not be below the fit minimum",
+            });
+        }
+
+        if let Some(effort) = &new.effort {
+            recognized_code(effort, "effort", &EFFORTS)?;
+        }
+
+        // The rationale is meant as one or two sentences, not a second
+        // notes column.
+        if let Some(rationale) = &new.rationale
+            && rationale.chars().count() > 500
+        {
+            return Err(OpportunityValidationError {
+                field: "rationale",
+                reason: "must be 500 characters or fewer",
+            });
+        }
+
         if let Some(date) = &new.deadline_date
             && !is_iso_date(date)
         {
@@ -280,11 +364,42 @@ pub mod opportunities {
             });
         }
 
+        // A deadline kind or confidence describes the recorded deadline
+        // date; without a date there is nothing to describe, and dropping
+        // the value silently would hide the mismatch from the user.
+        if new.deadline_kind.is_some() && new.deadline_date.is_none() {
+            return Err(OpportunityValidationError {
+                field: "deadline_kind",
+                reason: "requires a deadline date",
+            });
+        }
+        if new.deadline_confidence.is_some() && new.deadline_date.is_none() {
+            return Err(OpportunityValidationError {
+                field: "deadline_confidence",
+                reason: "requires a deadline date",
+            });
+        }
+        if let Some(kind) = &new.deadline_kind {
+            recognized_code(kind, "deadline_kind", &DEADLINE_KINDS)?;
+        }
+        if let Some(confidence) = &new.deadline_confidence {
+            recognized_code(confidence, "deadline_confidence", &DEADLINE_CONFIDENCES)?;
+        }
+
         if let Some(url) = &new.source_url
             && !is_http_url(url)
         {
             return Err(OpportunityValidationError {
                 field: "source_url",
+                reason: "must be an http or https web address",
+            });
+        }
+
+        if let Some(url) = &new.recruitment_page_url
+            && !is_http_url(url)
+        {
+            return Err(OpportunityValidationError {
+                field: "recruitment_page_url",
                 reason: "must be an http or https web address",
             });
         }
@@ -303,8 +418,16 @@ pub mod opportunities {
             city: row.try_get("city")?,
             country: row.try_get("country")?,
             priority: row.try_get("priority")?,
+            fit_min: row.try_get("fit_min")?,
+            fit_max: row.try_get("fit_max")?,
+            effort: row.try_get("effort")?,
+            rationale: row.try_get("rationale")?,
             deadline_date: row.try_get("deadline_date")?,
+            deadline_kind: row.try_get("deadline_kind")?,
+            deadline_confidence: row.try_get("deadline_confidence")?,
             source_url: row.try_get("source_url")?,
+            recruitment_page_url: row.try_get("recruitment_page_url")?,
+            source_notes: row.try_get("source_notes")?,
             notes: row.try_get("notes")?,
             stage: row.try_get("stage")?,
             created_at: row.try_get("created_at")?,
@@ -323,8 +446,10 @@ pub mod opportunities {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO opportunities \
              (user_id, organization, title, stream, city, country, priority, \
-              deadline_date, source_url, notes, stage) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+              fit_min, fit_max, effort, rationale, deadline_date, deadline_kind, \
+              deadline_confidence, source_url, recruitment_page_url, source_notes, \
+              notes, stage) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING id",
         )
         .bind(new.user_id)
@@ -334,8 +459,16 @@ pub mod opportunities {
         .bind(&new.city)
         .bind(&new.country)
         .bind(&new.priority)
+        .bind(new.fit_min)
+        .bind(new.fit_max)
+        .bind(&new.effort)
+        .bind(&new.rationale)
         .bind(&new.deadline_date)
+        .bind(&new.deadline_kind)
+        .bind(&new.deadline_confidence)
         .bind(&new.source_url)
+        .bind(&new.recruitment_page_url)
+        .bind(&new.source_notes)
         .bind(&new.notes)
         .bind(&new.stage)
         .fetch_one(pool)
@@ -352,7 +485,9 @@ pub mod opportunities {
     ) -> Result<Option<Opportunity>, sqlx::Error> {
         sqlx::query(
             "SELECT id, user_id, organization, title, stream, city, country, priority, \
-             deadline_date, source_url, notes, stage, created_at \
+             fit_min, fit_max, effort, rationale, deadline_date, deadline_kind, \
+             deadline_confidence, source_url, recruitment_page_url, source_notes, \
+             notes, stage, created_at \
              FROM opportunities WHERE id = ?",
         )
         .bind(id)
@@ -369,7 +504,9 @@ pub mod opportunities {
     ) -> Result<Vec<Opportunity>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, user_id, organization, title, stream, city, country, priority, \
-             deadline_date, source_url, notes, stage, created_at \
+             fit_min, fit_max, effort, rationale, deadline_date, deadline_kind, \
+             deadline_confidence, source_url, recruitment_page_url, source_notes, \
+             notes, stage, created_at \
              FROM opportunities ORDER BY created_at DESC, id DESC LIMIT ?",
         )
         .bind(limit)
@@ -398,7 +535,9 @@ pub mod opportunities {
         let pattern = format!("%{}%", escape_like(query.trim()));
         let rows = sqlx::query(
             "SELECT id, user_id, organization, title, stream, city, country, priority, \
-             deadline_date, source_url, notes, stage, created_at \
+             fit_min, fit_max, effort, rationale, deadline_date, deadline_kind, \
+             deadline_confidence, source_url, recruitment_page_url, source_notes, \
+             notes, stage, created_at \
              FROM opportunities \
              WHERE organization LIKE ?1 ESCAPE '\\' \
                 OR title LIKE ?1 ESCAPE '\\' \
@@ -427,8 +566,10 @@ pub mod opportunities {
         let result = sqlx::query(
             "UPDATE opportunities \
              SET user_id = ?, organization = ?, title = ?, stream = ?, city = ?, \
-                 country = ?, priority = ?, deadline_date = ?, source_url = ?, \
-                 notes = ?, stage = ? \
+                 country = ?, priority = ?, fit_min = ?, fit_max = ?, effort = ?, \
+                 rationale = ?, deadline_date = ?, deadline_kind = ?, \
+                 deadline_confidence = ?, source_url = ?, recruitment_page_url = ?, \
+                 source_notes = ?, notes = ?, stage = ? \
              WHERE id = ?",
         )
         .bind(new.user_id)
@@ -438,8 +579,16 @@ pub mod opportunities {
         .bind(&new.city)
         .bind(&new.country)
         .bind(&new.priority)
+        .bind(new.fit_min)
+        .bind(new.fit_max)
+        .bind(&new.effort)
+        .bind(&new.rationale)
         .bind(&new.deadline_date)
+        .bind(&new.deadline_kind)
+        .bind(&new.deadline_confidence)
         .bind(&new.source_url)
+        .bind(&new.recruitment_page_url)
+        .bind(&new.source_notes)
         .bind(&new.notes)
         .bind(&new.stage)
         .bind(id)

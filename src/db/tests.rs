@@ -24,8 +24,18 @@ fn sample_opportunity() -> NewOpportunity {
         city: Some("Schneckenhausen".to_string()),
         country: Some("Germany".to_string()),
         priority: "p1".to_string(),
+        fit_min: Some(3.5),
+        fit_max: Some(4.0),
+        effort: Some("medium".to_string()),
+        rationale: Some(
+            "Good refrigeration; lack of direct experience in making it work.".to_string(),
+        ),
         deadline_date: Some("2027-01-15".to_string()),
+        deadline_kind: Some("hard_close".to_string()),
+        deadline_confidence: Some("verified".to_string()),
         source_url: Some("https://www.example.org/vacancy".to_string()),
+        recruitment_page_url: Some("https://www.example.org/research".to_string()),
+        source_notes: Some("Deadline confirmed on the department page.".to_string()),
         notes: Some(
             "Solid measurement background expected; the main gap is cryogenic experience."
                 .to_string(),
@@ -44,8 +54,16 @@ fn sample_it_opportunity() -> NewOpportunity {
         city: Some("Musterstadt".to_string()),
         country: Some("Germany".to_string()),
         priority: "p3".to_string(),
+        fit_min: None,
+        fit_max: None,
+        effort: None,
+        rationale: None,
         deadline_date: Some("2027-03-01".to_string()),
+        deadline_kind: None,
+        deadline_confidence: None,
         source_url: Some("https://www.example.org/jobs/synergy-engineer".to_string()),
+        recruitment_page_url: None,
+        source_notes: None,
         notes: Some(
             "Promises to disrupt everything; the posting never says what is actually built."
                 .to_string(),
@@ -70,7 +88,24 @@ async fn opportunity_round_trip_preserves_all_fields() {
     assert_eq!(stored.city.as_deref(), Some("Schneckenhausen"));
     assert_eq!(stored.country.as_deref(), Some("Germany"));
     assert_eq!(stored.priority, "p1");
+    assert_eq!(stored.fit_min, Some(3.5));
+    assert_eq!(stored.fit_max, Some(4.0));
+    assert_eq!(stored.effort.as_deref(), Some("medium"));
+    assert_eq!(
+        stored.rationale.as_deref(),
+        Some("Good refrigeration; lack of direct experience in making it work.")
+    );
     assert_eq!(stored.deadline_date.as_deref(), Some("2027-01-15"));
+    assert_eq!(stored.deadline_kind.as_deref(), Some("hard_close"));
+    assert_eq!(stored.deadline_confidence.as_deref(), Some("verified"));
+    assert_eq!(
+        stored.recruitment_page_url.as_deref(),
+        Some("https://www.example.org/research")
+    );
+    assert_eq!(
+        stored.source_notes.as_deref(),
+        Some("Deadline confirmed on the department page.")
+    );
     assert_eq!(
         stored.source_url.as_deref(),
         Some("https://www.example.org/vacancy")
@@ -89,8 +124,16 @@ async fn absent_optional_fields_stay_absent() {
     let mut new = sample_opportunity();
     new.city = None;
     new.country = None;
+    new.fit_min = None;
+    new.fit_max = None;
+    new.effort = None;
+    new.rationale = None;
     new.deadline_date = None;
+    new.deadline_kind = None;
+    new.deadline_confidence = None;
     new.source_url = None;
+    new.recruitment_page_url = None;
+    new.source_notes = None;
     new.notes = None;
 
     let id = insert_opportunity(&pool, &new).await.unwrap();
@@ -98,8 +141,16 @@ async fn absent_optional_fields_stay_absent() {
 
     assert!(stored.city.is_none());
     assert!(stored.country.is_none());
+    assert!(stored.fit_min.is_none());
+    assert!(stored.fit_max.is_none());
+    assert!(stored.effort.is_none());
+    assert!(stored.rationale.is_none());
     assert!(stored.deadline_date.is_none());
+    assert!(stored.deadline_kind.is_none());
+    assert!(stored.deadline_confidence.is_none());
     assert!(stored.source_url.is_none());
+    assert!(stored.recruitment_page_url.is_none());
+    assert!(stored.source_notes.is_none());
     assert!(stored.notes.is_none());
 }
 
@@ -324,6 +375,10 @@ async fn update_changes_stored_values() {
     edited.title = "PhD position, cryogenic detectors".to_string();
     edited.stage = "researching".to_string();
     edited.deadline_date = None;
+    // A kind or confidence without the date it describes is rejected, so
+    // clearing the deadline clears them as well.
+    edited.deadline_kind = None;
+    edited.deadline_confidence = None;
     update_opportunity(&pool, id, &edited)
         .await
         .unwrap()
@@ -397,6 +452,162 @@ async fn search_matches_fields_and_escapes_wildcards() {
     // No match yields an empty list.
     let hits = search_opportunities(&pool, "quantum", 10).await.unwrap();
     assert!(hits.is_empty());
+}
+
+// --- Opportunity metadata: fit, effort, rationale, deadline facts ---
+
+#[tokio::test]
+async fn fit_values_outside_the_range_or_inverted_are_rejected() {
+    let pool = migrated_pool().await;
+
+    let mut new = sample_opportunity();
+    new.fit_min = Some(0.5);
+    assert_eq!(validate_new_opportunity(&new).unwrap_err().field, "fit_min");
+
+    new = sample_opportunity();
+    new.fit_max = Some(5.5);
+    assert_eq!(validate_new_opportunity(&new).unwrap_err().field, "fit_max");
+
+    new = sample_opportunity();
+    new.fit_min = Some(4.5);
+    new.fit_max = Some(3.5);
+    let err = insert_opportunity(&pool, &new).await.unwrap_err();
+    assert!(matches!(err, OpportunityInsertError::Validation(err) if err.field == "fit_max"));
+    assert_eq!(count_opportunities(&pool).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn fit_bounds_are_also_enforced_by_the_column_checks() {
+    let pool = migrated_pool().await;
+    let id = insert_opportunity(&pool, &sample_opportunity())
+        .await
+        .unwrap();
+
+    // Code validation covers the range; the column checks back it up for
+    // any write that bypasses the data layer.
+    let err = sqlx::query("UPDATE opportunities SET fit_min = 9 WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn effort_accepts_only_known_levels() {
+    let pool = migrated_pool().await;
+
+    let mut new = sample_opportunity();
+    new.effort = Some("heroic".to_string());
+    assert_eq!(validate_new_opportunity(&new).unwrap_err().field, "effort");
+
+    // An unrated effort stays absent instead of becoming a placeholder.
+    new = sample_opportunity();
+    new.effort = None;
+    let id = insert_opportunity(&pool, &new).await.unwrap();
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert!(stored.effort.is_none());
+}
+
+#[tokio::test]
+async fn long_rationales_are_rejected_before_any_sql_runs() {
+    let pool = migrated_pool().await;
+
+    let mut new = sample_opportunity();
+    new.rationale = Some("x".repeat(501));
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "rationale"
+    );
+    let err = insert_opportunity(&pool, &new).await.unwrap_err();
+    assert!(matches!(err, OpportunityInsertError::Validation(_)));
+    assert_eq!(count_opportunities(&pool).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn deadline_kind_and_confidence_require_a_deadline_date() {
+    let pool = migrated_pool().await;
+
+    // The sample carries a kind and a confidence; without the date they
+    // are rejected rather than silently dropped.
+    let mut new = sample_opportunity();
+    new.deadline_date = None;
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "deadline_kind"
+    );
+
+    new.deadline_kind = None;
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "deadline_confidence"
+    );
+
+    // With the date present, both are accepted and stored.
+    new.deadline_kind = Some("hard_close".to_string());
+    new.deadline_date = Some("2027-01-15".to_string());
+    let id = insert_opportunity(&pool, &new).await.unwrap();
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert_eq!(stored.deadline_kind.as_deref(), Some("hard_close"));
+    assert_eq!(stored.deadline_confidence.as_deref(), Some("verified"));
+}
+
+#[tokio::test]
+async fn recruitment_page_urls_must_be_web_addresses() {
+    let pool = migrated_pool().await;
+
+    let mut new = sample_opportunity();
+    new.recruitment_page_url = Some("ftp://files.example.org/jobs".to_string());
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "recruitment_page_url"
+    );
+
+    new.recruitment_page_url = Some("https://".to_string());
+    assert_eq!(
+        validate_new_opportunity(&new).unwrap_err().field,
+        "recruitment_page_url"
+    );
+
+    new.recruitment_page_url = Some("https://www.example.org/research".to_string());
+    let id = insert_opportunity(&pool, &new).await.unwrap();
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.recruitment_page_url.as_deref(),
+        Some("https://www.example.org/research")
+    );
+}
+
+#[tokio::test]
+async fn metadata_updates_clear_and_store_values() {
+    let pool = migrated_pool().await;
+    let id = insert_opportunity(&pool, &sample_opportunity())
+        .await
+        .unwrap();
+
+    // Clearing the optional metadata stores NULLs, not placeholders.
+    let mut cleared = sample_opportunity();
+    cleared.fit_min = None;
+    cleared.fit_max = None;
+    cleared.effort = None;
+    cleared.rationale = None;
+    cleared.deadline_kind = None;
+    cleared.deadline_confidence = None;
+    cleared.recruitment_page_url = None;
+    cleared.source_notes = None;
+    update_opportunity(&pool, id, &cleared)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stored = get_opportunity(&pool, id).await.unwrap().unwrap();
+    assert!(stored.fit_min.is_none());
+    assert!(stored.fit_max.is_none());
+    assert!(stored.effort.is_none());
+    assert!(stored.rationale.is_none());
+    assert!(stored.deadline_kind.is_none());
+    assert!(stored.deadline_confidence.is_none());
+    assert!(stored.recruitment_page_url.is_none());
+    assert!(stored.source_notes.is_none());
 }
 
 // --- Applications: attempts, confirmed submissions, corrections ---

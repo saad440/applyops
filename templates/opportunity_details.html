@@ -13,6 +13,27 @@
     <dt>Deadline</dt>
     <dd>{{ deadline_display }}</dd>
 
+    {% match deadline_kind_display %}
+    {% when Some with (kind) %}
+    <dt>Deadline type</dt>
+    <dd>{{ kind }}</dd>
+    {% when None %}
+    {% endmatch %}
+
+    {% match fit_display %}
+    {% when Some with (fit) %}
+    <dt>Fit</dt>
+    <dd>{{ fit }}</dd>
+    {% when None %}
+    {% endmatch %}
+
+    {% match effort_display %}
+    {% when Some with (effort) %}
+    <dt>Effort</dt>
+    <dd>{{ effort }}</dd>
+    {% when None %}
+    {% endmatch %}
+
     {% match location_display %}
     {% when Some with (place) %}
     <dt>Location</dt>
@@ -20,10 +41,31 @@
     {% when None %}
     {% endmatch %}
 
+    {% match rationale %}
+    {% when Some with (text) %}
+    <dt>Rationale</dt>
+    <dd>{{ text }}</dd>
+    {% when None %}
+    {% endmatch %}
+
     {% match external_url %}
     {% when Some with (url) %}
     <dt>Source</dt>
     <dd><a href="{{ url }}" rel="noopener noreferrer">{{ url }}</a></dd>
+    {% when None %}
+    {% endmatch %}
+
+    {% match recruitment_url %}
+    {% when Some with (url) %}
+    <dt>Recruitment page</dt>
+    <dd><a href="{{ url }}" rel="noopener noreferrer">{{ url }}</a></dd>
+    {% when None %}
+    {% endmatch %}
+
+    {% match source_notes %}
+    {% when Some with (text) %}
+    <dt>Source verification</dt>
+    <dd>{{ text }}</dd>
     {% when None %}
     {% endmatch %}
 

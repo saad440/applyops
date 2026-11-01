@@ -101,6 +101,85 @@
     </div>
   </div>
 
+  <div class="field-row">
+    <div class="field">
+      <label for="fit_min">Fit minimum (optional)</label>
+      <input id="fit_min" name="fit_min" type="number" step="0.5" min="1" max="5" value="{{ values.fit_min }}">
+      {% match fit_min_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Fit minimum {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="field">
+      <label for="fit_max">Fit maximum (optional)</label>
+      <input id="fit_max" name="fit_max" type="number" step="0.5" min="1" max="5" value="{{ values.fit_max }}">
+      {% match fit_max_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Fit maximum {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="field">
+      <label for="effort">Preparation effort (optional)</label>
+      <select id="effort" name="effort">
+        <option value="" {% if values.effort.is_empty() %}selected{% endif %}>Not estimated</option>
+        <option value="low" {% if values.effort == "low" %}selected{% endif %}>Low</option>
+        <option value="medium" {% if values.effort == "medium" %}selected{% endif %}>Medium</option>
+        <option value="high" {% if values.effort == "high" %}selected{% endif %}>High</option>
+      </select>
+      {% match effort_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Preparation effort {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="rationale">Rationale (optional)</label>
+    <textarea id="rationale" name="rationale" rows="2" maxlength="500">{{ values.rationale }}</textarea>
+    <p class="hint">One or two sentences: the strongest fit and the biggest gap.</p>
+    {% match rationale_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Rationale {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field-row">
+    <div class="field">
+      <label for="deadline_kind">Deadline type (optional)</label>
+      <select id="deadline_kind" name="deadline_kind">
+        <option value="" {% if values.deadline_kind.is_empty() %}selected{% endif %}>Not recorded</option>
+        <option value="hard_close" {% if values.deadline_kind == "hard_close" %}selected{% endif %}>Hard close</option>
+        <option value="priority_review" {% if values.deadline_kind == "priority_review" %}selected{% endif %}>Priority consideration</option>
+        <option value="first_review" {% if values.deadline_kind == "first_review" %}selected{% endif %}>First review</option>
+        <option value="soft_target" {% if values.deadline_kind == "soft_target" %}selected{% endif %}>Soft target</option>
+      </select>
+      <p class="hint">Describes the deadline date above; it needs a date to be recorded.</p>
+      {% match deadline_kind_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Deadline type {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="field">
+      <label for="deadline_confidence">Deadline confidence (optional)</label>
+      <select id="deadline_confidence" name="deadline_confidence">
+        <option value="" {% if values.deadline_confidence.is_empty() %}selected{% endif %}>Not assessed</option>
+        <option value="verified" {% if values.deadline_confidence == "verified" %}selected{% endif %}>Verified</option>
+        <option value="unverified" {% if values.deadline_confidence == "unverified" %}selected{% endif %}>Unverified</option>
+        <option value="conflicting" {% if values.deadline_confidence == "conflicting" %}selected{% endif %}>Conflicting dates</option>
+      </select>
+      {% match deadline_confidence_error %}
+      {% when Some with (error) %}
+      <p class="field-error">Deadline confidence {{ error }}.</p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
   <div class="field">
     <label for="source_url">Source URL (optional)</label>
     <input id="source_url" name="source_url" type="url" value="{{ values.source_url }}" maxlength="500" placeholder="https://">
@@ -109,6 +188,22 @@
     <p class="field-error">Source URL {{ error }}.</p>
     {% when None %}
     {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="recruitment_page_url">Recruitment page (optional)</label>
+    <input id="recruitment_page_url" name="recruitment_page_url" type="url" value="{{ values.recruitment_page_url }}" maxlength="500" placeholder="https://">
+    <p class="hint">Fallback page for speculative leads without a concrete advert.</p>
+    {% match recruitment_page_url_error %}
+    {% when Some with (error) %}
+    <p class="field-error">Recruitment page {{ error }}.</p>
+    {% when None %}
+    {% endmatch %}
+  </div>
+
+  <div class="field">
+    <label for="source_notes">Source verification notes (optional)</label>
+    <textarea id="source_notes" name="source_notes" rows="2">{{ values.source_notes }}</textarea>
   </div>
 
   <div class="field">

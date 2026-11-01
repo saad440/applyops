@@ -50,6 +50,23 @@ fn university_pairs() -> Vec<(String, String)> {
         ("priority".to_string(), "p1".to_string()),
         ("stage".to_string(), "discovered".to_string()),
         ("deadline_date".to_string(), "2027-01-15".to_string()),
+        ("fit_min".to_string(), "3.5".to_string()),
+        ("fit_max".to_string(), "4".to_string()),
+        ("effort".to_string(), "medium".to_string()),
+        (
+            "rationale".to_string(),
+            "Good refrigeration; lack of direct experience in making it work.".to_string(),
+        ),
+        ("deadline_kind".to_string(), "hard_close".to_string()),
+        ("deadline_confidence".to_string(), "verified".to_string()),
+        (
+            "recruitment_page_url".to_string(),
+            "https://www.example.org/research".to_string(),
+        ),
+        (
+            "source_notes".to_string(),
+            "Deadline confirmed on the department page.".to_string(),
+        ),
     ]
 }
 
@@ -314,6 +331,10 @@ async fn update_opportunity_redirects_and_persists() {
     );
     edited[4] = ("stage".to_string(), "researching".to_string());
     edited[5] = ("deadline_date".to_string(), String::new());
+    // A deadline type without the date it describes is rejected, so
+    // clearing the deadline clears it as well.
+    edited[10] = ("deadline_kind".to_string(), String::new());
+    edited[11] = ("deadline_confidence".to_string(), String::new());
 
     let response = update_opportunity(State(state.clone()), Path(1), Form(edited))
         .await
@@ -336,6 +357,124 @@ async fn update_opportunity_redirects_and_persists() {
     let response = root(State(state), Query(Vec::new())).await.into_response();
     let body = body_string(response).await;
     assert!(body.contains("cryogenic detectors"));
+}
+
+#[tokio::test]
+async fn opportunity_metadata_round_trips_through_form_and_details() {
+    let state = test_state().await;
+    let response = create_opportunity(State(state.clone()), Form(university_pairs()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // The details page shows the stored metadata.
+    let body = body_string(
+        opportunity_details(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("3.5–4/5"));
+    assert!(body.contains("Medium"));
+    assert!(body.contains("Hard close · Verified"));
+    assert!(body.contains("Good refrigeration"));
+    assert!(body.contains(r#"href="https://www.example.org/research""#));
+    assert!(body.contains("Deadline confirmed on the department page."));
+
+    // The edit form is prefilled with the stored values.
+    let body = body_string(
+        edit_opportunity_form(State(state.clone()), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains(r#"value="3.5""#));
+    assert!(body.contains(r#"value="4""#));
+    assert!(body.contains(r#"<option value="medium" selected>"#));
+    assert!(body.contains(r#"<option value="hard_close" selected>"#));
+    assert!(body.contains(r#"<option value="verified" selected>"#));
+
+    // Clearing the metadata on edit removes it from the page again.
+    let mut cleared = university_pairs();
+    cleared[6] = ("fit_min".to_string(), String::new());
+    cleared[7] = ("fit_max".to_string(), String::new());
+    cleared[8] = ("effort".to_string(), String::new());
+    cleared[9] = ("rationale".to_string(), String::new());
+    cleared[10] = ("deadline_kind".to_string(), String::new());
+    cleared[11] = ("deadline_confidence".to_string(), String::new());
+    cleared[12] = ("recruitment_page_url".to_string(), String::new());
+    cleared[13] = ("source_notes".to_string(), String::new());
+    assert_redirect(update_opportunity(State(state.clone()), Path(1), Form(cleared)).await);
+
+    let body = body_string(
+        opportunity_details(State(state), Path(1))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(!body.contains("3.5–4/5"));
+    assert!(!body.contains("Hard close"));
+}
+
+#[tokio::test]
+async fn an_out_of_range_fit_is_reported_on_its_field() {
+    let state = test_state().await;
+    let mut pairs = university_pairs();
+    pairs[7] = ("fit_max".to_string(), "9".to_string());
+
+    let response = create_opportunity(State(state.clone()), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Fit maximum must be a number between 1 and 5"));
+    assert_eq!(
+        db::opportunities::count_opportunities(&state.db)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A value that is not a number at all is named the same way.
+    let mut pairs = university_pairs();
+    pairs[6] = ("fit_min".to_string(), "soon".to_string());
+    let response = create_opportunity(State(state.clone()), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Fit minimum must be a number between 1 and 5"));
+
+    // The maximum below the minimum is reported on the maximum.
+    let mut pairs = university_pairs();
+    pairs[6] = ("fit_min".to_string(), "4".to_string());
+    pairs[7] = ("fit_max".to_string(), "2".to_string());
+    let response = create_opportunity(State(state), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Fit maximum must not be below the fit minimum"));
+}
+
+#[tokio::test]
+async fn a_deadline_type_without_a_date_is_reported_on_the_form() {
+    let state = test_state().await;
+    let mut pairs = university_pairs();
+    pairs[5] = ("deadline_date".to_string(), String::new());
+
+    let response = create_opportunity(State(state.clone()), Form(pairs))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Deadline type requires a deadline date"));
+    assert_eq!(
+        db::opportunities::count_opportunities(&state.db)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
