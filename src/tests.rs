@@ -3,6 +3,15 @@
 
 use super::*;
 
+use axum::extract::{Form, Path, Query, State};
+
+use crate::web::dashboard::DeadlineEntryVm;
+use crate::web::display::{
+    civil_from_days, countdown_label, days_from_civil, format_date_human, parse_iso_day_number,
+};
+use crate::web::opportunities::OpportunityListTemplate;
+use crate::web::*;
+
 /// Application state over a fresh in-memory database with migrations and
 /// default streams, mirroring server startup.
 async fn test_state() -> AppState {
@@ -1432,10 +1441,7 @@ fn dashboard_entries_carry_display_fields_and_urgency() {
         overdue.heading,
         "Universität Schneckenhausen — Doctoral researcher"
     );
-    assert_eq!(
-        overdue.subtitle,
-        "QI · P2 · Schneckenhausen, Testland"
-    );
+    assert_eq!(overdue.subtitle, "QI · P2 · Schneckenhausen, Testland");
     assert_eq!(overdue.deadline_display, "15 Oct 2026");
     assert_eq!(
         overdue.deadline_detail.as_deref(),
