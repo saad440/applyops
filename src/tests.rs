@@ -5,7 +5,7 @@ use super::*;
 
 use axum::extract::{Form, Path, Query, State};
 
-use crate::web::dashboard::DeadlineEntryVm;
+use crate::web::dashboard::{DeadlineEntryVm, assemble_timeline};
 use crate::web::display::{
     civil_from_days, countdown_label, days_from_civil, format_date_human, parse_iso_day_number,
 };
@@ -1431,24 +1431,20 @@ fn iso_day_parsing_rejects_non_dates() {
 }
 
 #[test]
-fn dashboard_entries_carry_display_fields_and_urgency() {
-    // Fixed as-of date so the displayed urgency is deterministic.
-    let as_of = days_from_civil(2026, 10, 19);
-
-    let overdue =
-        DeadlineEntryVm::from_opportunity(&stored_opportunity_with(Some("2026-10-15")), as_of);
+fn dashboard_entries_carry_display_fields() {
+    let overdue = DeadlineEntryVm::from_opportunity(&stored_opportunity_with(Some("2026-10-15")));
     assert_eq!(
         overdue.heading,
         "Universität Schneckenhausen — Doctoral researcher"
     );
-    assert_eq!(overdue.subtitle, "QI · P2 · Schneckenhausen, Testland");
-    assert_eq!(overdue.deadline_display, "15 Oct 2026");
+    assert_eq!(overdue.stream, "QI");
+    // The stream lives on the timeline column, so the subtitle starts with
+    // the priority instead of repeating it.
+    assert_eq!(overdue.subtitle, "P2 · Schneckenhausen, Testland");
     assert_eq!(
         overdue.deadline_detail.as_deref(),
         Some("Hard close · Verified")
     );
-    assert_eq!(overdue.countdown_display.as_deref(), Some("4 days overdue"));
-    assert!(overdue.overdue);
     assert_eq!(overdue.priority_class, "p2");
     assert_eq!(
         overdue.meta_display.as_deref(),
@@ -1458,16 +1454,66 @@ fn dashboard_entries_carry_display_fields_and_urgency() {
     assert_eq!(external.label, "Source");
     assert_eq!(external.url, "https://www.example.org/vacancy");
 
-    let upcoming =
-        DeadlineEntryVm::from_opportunity(&stored_opportunity_with(Some("2026-10-23")), as_of);
-    assert_eq!(upcoming.countdown_display.as_deref(), Some("in 4 days"));
-    assert!(!upcoming.overdue);
-
-    // Without a date there is no countdown and no invented one.
-    let undated = DeadlineEntryVm::from_opportunity(&stored_opportunity_with(None), as_of);
-    assert_eq!(undated.countdown_display, None);
-    assert!(!undated.overdue);
+    // A card without a deadline carries no invented deadline labeling.
+    let undated = DeadlineEntryVm::from_opportunity(&stored_opportunity_with(None));
     assert_eq!(undated.deadline_detail, None);
+}
+
+#[test]
+fn the_timeline_groups_entries_into_stream_columns_and_date_rows() {
+    // Fixed as-of date so countdowns are deterministic.
+    let as_of = days_from_civil(2026, 10, 19);
+
+    // The order the query returns: deadline date, then priority, then
+    // organization. Two streams share the first date; the second date lies
+    // before the as-of day.
+    let mut p1_quantum = stored_opportunity_with(Some("2026-10-23"));
+    p1_quantum.id = 1;
+    p1_quantum.stream = "QI".to_string();
+    p1_quantum.priority = "p1".to_string();
+    let mut p3_quantum = stored_opportunity_with(Some("2026-10-23"));
+    p3_quantum.id = 2;
+    p3_quantum.stream = "QI".to_string();
+    p3_quantum.priority = "p3".to_string();
+    let mut physics = stored_opportunity_with(Some("2026-10-23"));
+    physics.id = 3;
+    physics.stream = "Physics".to_string();
+    let mut past_quantum = stored_opportunity_with(Some("2026-10-15"));
+    past_quantum.id = 4;
+    past_quantum.stream = "QI".to_string();
+
+    let (columns, rows) =
+        assemble_timeline(&[p1_quantum, p3_quantum, physics, past_quantum], as_of);
+
+    // Columns are the streams that actually occur, case-insensitively
+    // sorted.
+    assert_eq!(columns, ["Physics", "QI"]);
+
+    assert_eq!(rows.len(), 2);
+
+    // First row: 23 Oct 2026, cards placed in their stream's column in the
+    // order the query returned them.
+    assert_eq!(rows[0].date_display, "23 Oct 2026");
+    assert_eq!(rows[0].countdown_display, "in 4 days");
+    assert!(!rows[0].overdue);
+    assert_eq!(rows[0].cells[0].entries[0].opportunity_id, 3); // Physics
+    assert_eq!(rows[0].cells[1].entries[0].opportunity_id, 1); // QI, p1
+    assert_eq!(rows[0].cells[1].entries[1].opportunity_id, 2); // QI, p3
+
+    // Second row: 15 Oct 2026, before the as-of day and labeled honestly.
+    assert_eq!(rows[1].date_display, "15 Oct 2026");
+    assert_eq!(rows[1].countdown_display, "4 days overdue");
+    assert!(rows[1].overdue);
+    assert_eq!(rows[1].cells[0].entries.len(), 0);
+    assert_eq!(rows[1].cells[1].entries[0].opportunity_id, 4);
+}
+
+#[test]
+fn an_empty_timeline_has_no_columns_or_rows() {
+    let as_of = days_from_civil(2026, 10, 19);
+    let (columns, rows) = assemble_timeline(&[], as_of);
+    assert!(columns.is_empty());
+    assert!(rows.is_empty());
 }
 
 #[tokio::test]

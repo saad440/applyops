@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
-  <main class="page">
+  <main class="page {% block page_class %}{% endblock %}">
     {% block content %}{% endblock %}
   </main>
 </body>

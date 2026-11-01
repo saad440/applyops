@@ -359,30 +359,89 @@ a {
   margin-top: var(--space-4);
 }
 
-/* Dashboard: ordered next-deadlines view. */
-.deadline-list {
-  list-style: none;
-  margin: 0 0 var(--space-4);
-  padding: 0;
+/* Dashboard: deadline timeline. The page-level width cap is lifted for the
+   dashboard; the timeline spans the viewport while the sections above and
+   below stay at the usual reading width. Only the timeline scrolls
+   horizontally when the columns need more room than the window gives. */
+.page-dashboard {
+  max-width: none;
+}
+
+.constrained {
+  max-width: 60rem;
+  margin-inline: auto;
+}
+
+.timeline-scroll {
+  overflow-x: auto;
+  padding: var(--space-1) var(--space-4) var(--space-3);
+}
+
+.timeline-grid {
+  display: grid;
+  grid-template-columns: var(--timeline-columns);
+}
+
+.timeline-col-head {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.timeline-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--color-bg);
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-2) var(--space-3);
+}
+
+.timeline-date-head {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.timeline-row {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.timeline-row:last-child {
+  border-bottom: 0;
+}
+
+.timeline-date .deadline-date {
+  display: block;
+  font-weight: 600;
+}
+
+.timeline-date .countdown {
+  display: block;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.timeline-date.overdue .countdown {
+  color: var(--color-error);
+  font-weight: 600;
+}
+
+.timeline-cell {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-}
-
-.deadline-list h2 {
-  margin: 0 0 var(--space-1);
-  font-size: 1.1rem;
-}
-
-.deadline-list p {
-  margin: 0 0 var(--space-1);
+  gap: var(--space-2);
+  padding: var(--space-2);
+  min-width: 0;
 }
 
 .deadline-entry {
   --entry-accent: var(--color-priority-p3);
   border-left: 4px solid var(--entry-accent);
-  display: flex;
-  gap: var(--space-3);
+  margin: 0;
 }
 
 .deadline-entry.priority-p1 {
@@ -393,27 +452,61 @@ a {
   --entry-accent: var(--color-priority-p2);
 }
 
-.deadline-when {
-  flex-shrink: 0;
-  min-width: 8.5rem;
+.deadline-entry h2 {
+  margin: 0 0 var(--space-1);
+  font-size: 1rem;
 }
 
-.deadline-date {
-  display: block;
-  font-weight: 600;
+.deadline-entry p {
+  margin: 0 0 var(--space-1);
 }
 
-.countdown {
-  display: block;
-  color: var(--color-muted);
-  font-size: 0.875rem;
+/* Long rationales are summarized to two lines; the details page has the
+   full text, so nothing is hidden, only compacted. */
+.rationale {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
-.deadline-entry.overdue .countdown {
-  color: var(--color-error);
-  font-weight: 600;
+/* The stream chip only appears in the stacked narrow layout, where the
+   column headers are gone and each card must say which stream it is. */
+.stream-chip {
+  display: none;
 }
 
-.deadline-what {
-  min-width: 0;
+@media (max-width: 40rem) {
+  .timeline-head {
+    display: none;
+  }
+
+  .timeline-grid {
+    display: block;
+  }
+
+  .timeline-gutter {
+    position: static;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .timeline-cell {
+    padding: var(--space-2) 0;
+  }
+
+  .timeline-cell:empty {
+    display: none;
+  }
+
+  .stream-chip {
+    display: inline-block;
+    margin-bottom: var(--space-1);
+    padding: 0.05em 0.5em;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    background: var(--color-bg);
+    color: var(--color-muted);
+    font-size: 0.75rem;
+  }
 }
