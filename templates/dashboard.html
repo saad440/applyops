@@ -7,12 +7,45 @@
 {% block content %}
 <header class="page-header constrained">
   <h1>Dashboard</h1>
-  <p class="muted">Deadline timeline · {{ entry_count }} shown · as of {{ as_of_display }}</p>
+  <p class="muted">Deadline timeline · {{ entry_count }} shown · as of {{ as_of_display }}{% if filters_active %} · filtered{% endif %}</p>
 </header>
+
+<form method="get" action="/dashboard" class="filter-form constrained">
+  <fieldset>
+    <legend>Streams</legend>
+    {% for stream in filter_streams %}
+    <label><input type="checkbox" name="stream" value="{{ stream.name }}"{% if stream.checked %} checked{% endif %}> {{ stream.name }}</label>
+    {% endfor %}
+  </fieldset>
+  <fieldset>
+    <legend>Priority</legend>
+    <label><input type="radio" name="priority" value="all"{% if filter_priority_all %} checked{% endif %}> All</label>
+    <label><input type="radio" name="priority" value="p1"{% if filter_priority_p1 %} checked{% endif %}> P1</label>
+    <label><input type="radio" name="priority" value="p1p2"{% if filter_priority_p1p2 %} checked{% endif %}> P1+P2</label>
+  </fieldset>
+  <fieldset>
+    <legend>Horizon</legend>
+    <label><input type="radio" name="horizon" value="all"{% if filter_horizon_all %} checked{% endif %}> All upcoming</label>
+    <label><input type="radio" name="horizon" value="14"{% if filter_horizon_14 %} checked{% endif %}> 14 days</label>
+    <label><input type="radio" name="horizon" value="30"{% if filter_horizon_30 %} checked{% endif %}> 30 days</label>
+    <label><input type="radio" name="horizon" value="90"{% if filter_horizon_90 %} checked{% endif %}> 90 days</label>
+  </fieldset>
+  <fieldset>
+    <legend>Past due</legend>
+    <label><input type="checkbox" name="past_due" value="1"{% if show_past_due %} checked{% endif %}> Show past due</label>
+  </fieldset>
+  <span class="filter-actions">
+    <button type="submit">Apply filters</button>
+    {% if filters_active %}
+    <a href="/dashboard">Reset</a>
+    {% endif %}
+  </span>
+  <p class="hint">Filters apply to the deadline timeline and the focus list.</p>
+</form>
 
 {% if rows.is_empty() %}
 <section class="card constrained">
-  <p>No upcoming deadlines.</p>
+  <p>No upcoming deadlines{% if filters_active %} match the current filters — <a href="/dashboard">show everything</a>{% endif %}.</p>
   <p class="hint">Opportunities appear here once they have a recorded deadline date.</p>
   {% if !leads.is_empty() %}
   <p class="hint">Leads without a deadline are listed under <a href="#leads">Open-ended leads</a> below.</p>

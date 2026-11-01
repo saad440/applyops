@@ -4,18 +4,121 @@
 //! records the other pages edit, so no second copy can drift out of date.
 
 use askama::Template;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 
-use crate::{AppState, HtmlTemplate, db};
+use crate::{AppState, DEFAULT_USER_ID, HtmlTemplate, db};
 
 use super::display::{
     civil_from_days, countdown_label, display_label, format_date_human, format_deadline_detail,
     format_fit, format_location, parse_iso_day_number, today_day_number,
 };
 
-/// Width of the fixed date gutter in the timeline grid, in rem.
-const DATE_GUTTER_REM: i32 = 7;
+/// Width of the fixed date gutter in the timeline grid, in rem. Wide
+/// enough for a full date on one line.
+const DATE_GUTTER_REM: i32 = 8;
+
+/// The timeline filters, parsed from GET query parameters so filter state
+/// survives bookmarks, reloads, and the browser back button. Unknown or
+/// missing values fall back to the defaults, so a stale link never becomes
+/// an error page.
+#[derive(Debug)]
+pub struct DashboardFilters {
+    /// Stream labels to show; empty means every stream.
+    pub streams: Vec<String>,
+    /// `all` (default), `p1`, or `p1p2`.
+    pub priority: String,
+    /// Deadline window in days from the as-of day; `None` means all
+    /// upcoming.
+    pub horizon_days: Option<i64>,
+    /// Whether entries before the as-of day stay visible. Off by default:
+    /// triaged past-due records must not clutter the active view.
+    pub show_past_due: bool,
+}
+
+impl Default for DashboardFilters {
+    fn default() -> Self {
+        Self {
+            streams: Vec::new(),
+            priority: "all".to_string(),
+            horizon_days: None,
+            show_past_due: false,
+        }
+    }
+}
+
+impl DashboardFilters {
+    /// Parses the filter parameters from raw form pairs.
+    pub fn from_pairs(pairs: &[(String, String)]) -> Self {
+        let mut filters = Self::default();
+        let mut priority_seen = false;
+        let mut horizon_seen = false;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "stream" => {
+                    let label = value.trim().to_string();
+                    if !label.is_empty() && !filters.streams.contains(&label) {
+                        filters.streams.push(label);
+                    }
+                }
+                "priority" if !priority_seen => {
+                    priority_seen = true;
+                    if value == "p1" || value == "p1p2" {
+                        filters.priority = value.clone();
+                    }
+                }
+                "horizon" if !horizon_seen => {
+                    horizon_seen = true;
+                    filters.horizon_days = match value.as_str() {
+                        "14" => Some(14),
+                        "30" => Some(30),
+                        "90" => Some(90),
+                        _ => None,
+                    };
+                }
+                "past_due" => filters.show_past_due = value == "1",
+                _ => {}
+            }
+        }
+        filters
+    }
+
+    /// Whether any filter deviates from the defaults.
+    pub fn is_active(&self) -> bool {
+        !self.streams.is_empty()
+            || self.priority != "all"
+            || self.horizon_days.is_some()
+            || self.show_past_due
+    }
+
+    /// Whether an entry with the given stream, priority, and deadline day
+    /// stays visible under the filters.
+    pub fn keeps(&self, stream: &str, priority: &str, day: i64, as_of: i64) -> bool {
+        if !self.streams.is_empty() && !self.streams.iter().any(|known| known == stream) {
+            return false;
+        }
+        match self.priority.as_str() {
+            "p1" if priority != "p1" => return false,
+            "p1p2" if priority == "p3" => return false,
+            _ => {}
+        }
+        if day < as_of && !self.show_past_due {
+            return false;
+        }
+        if let Some(horizon) = self.horizon_days
+            && day > as_of + horizon
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// One stream label of the filter form with its checked state.
+struct FilterStreamVm {
+    name: String,
+    checked: bool,
+}
 
 /// Dashboard page: the deadline timeline, one row per deadline date and one
 /// column per stream that has deadline entries.
@@ -24,6 +127,17 @@ const DATE_GUTTER_REM: i32 = 7;
 struct DashboardTemplate {
     as_of_display: String,
     entry_count: i64,
+    /// Whether any filter is active; drives the reset hint.
+    filters_active: bool,
+    filter_streams: Vec<FilterStreamVm>,
+    filter_priority_all: bool,
+    filter_priority_p1: bool,
+    filter_priority_p1p2: bool,
+    filter_horizon_all: bool,
+    filter_horizon_14: bool,
+    filter_horizon_30: bool,
+    filter_horizon_90: bool,
+    show_past_due: bool,
     /// CSS `grid-template-columns` custom property for the timeline: the
     /// date gutter plus one flexible column per stream.
     grid_template: String,
@@ -332,13 +446,19 @@ pub fn assemble_timeline(
 }
 
 /// `GET /dashboard` — the deadline timeline: every actionable opportunity
-/// that has a recorded deadline, grouped by stream column and date row. A
-/// confirmed submission or withdrawal moves the card out of the timeline
-/// while the deadline facts on the opportunity stay untouched.
-pub async fn dashboard(State(state): State<AppState>) -> Response {
+/// that has a recorded deadline, grouped by stream column and date row,
+/// narrowed by the GET filters. A confirmed submission or withdrawal moves
+/// the card out of the timeline while the deadline facts on the opportunity
+/// stay untouched.
+pub async fn dashboard(
+    State(state): State<AppState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
     let as_of = today_day_number();
     let (year, month, day) = civil_from_days(as_of);
     let as_of_display = format_date_human(&format!("{year:04}-{month:02}-{day:02}"));
+
+    let filters = DashboardFilters::from_pairs(&pairs);
 
     let opportunities = match db::dashboard::upcoming_deadlines(&state.db, 100).await {
         Ok(opportunities) => opportunities,
@@ -348,7 +468,20 @@ pub async fn dashboard(State(state): State<AppState>) -> Response {
         }
     };
 
-    let (columns, rows) = assemble_timeline(&opportunities, as_of);
+    let visible: Vec<db::opportunities::Opportunity> = opportunities
+        .into_iter()
+        .filter(|opportunity| {
+            opportunity
+                .deadline_date
+                .as_deref()
+                .and_then(parse_iso_day_number)
+                .is_some_and(|day| {
+                    filters.keeps(&opportunity.stream, &opportunity.priority, day, as_of)
+                })
+        })
+        .collect();
+
+    let (columns, rows) = assemble_timeline(&visible, as_of);
     let grid_template = format!(
         "--timeline-columns: {DATE_GUTTER_REM}rem repeat({}, minmax(15rem, 1fr))",
         columns.len()
@@ -401,11 +534,36 @@ pub async fn dashboard(State(state): State<AppState>) -> Response {
         .collect();
     let pending_reports = report_counts.pending + report_counts.unknown;
 
-    let focus = assemble_focus(&opportunities, as_of);
+    let focus = assemble_focus(&visible, as_of);
+
+    let stream_labels = match db::streams::list_streams(&state.db, DEFAULT_USER_ID).await {
+        Ok(streams) => streams.into_iter().map(|stream| stream.name).collect(),
+        Err(err) => {
+            tracing::error!(%err, "failed to load stream labels");
+            Vec::new()
+        }
+    };
+    let filter_streams: Vec<FilterStreamVm> = stream_labels
+        .iter()
+        .map(|name| FilterStreamVm {
+            name: name.clone(),
+            checked: filters.streams.contains(name),
+        })
+        .collect();
 
     HtmlTemplate(DashboardTemplate {
-        entry_count: opportunities.len() as i64,
+        entry_count: visible.len() as i64,
         as_of_display,
+        filters_active: filters.is_active(),
+        filter_streams,
+        filter_priority_all: filters.priority == "all",
+        filter_priority_p1: filters.priority == "p1",
+        filter_priority_p1p2: filters.priority == "p1p2",
+        filter_horizon_all: filters.horizon_days.is_none(),
+        filter_horizon_14: filters.horizon_days == Some(14),
+        filter_horizon_30: filters.horizon_days == Some(30),
+        filter_horizon_90: filters.horizon_days == Some(90),
+        show_past_due: filters.show_past_due,
         grid_template,
         columns,
         rows,

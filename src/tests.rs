@@ -5,7 +5,7 @@ use super::*;
 
 use axum::extract::{Form, Path, Query, State};
 
-use crate::web::dashboard::{DeadlineEntryVm, assemble_focus, assemble_timeline};
+use crate::web::dashboard::{DashboardFilters, DeadlineEntryVm, assemble_focus, assemble_timeline};
 use crate::web::display::{
     civil_from_days, countdown_label, days_from_civil, format_date_human, parse_iso_day_number,
 };
@@ -1573,7 +1573,12 @@ async fn the_dashboard_shows_the_lower_sections_from_real_records() {
             .await,
     );
 
-    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    let body = body_string(
+        dashboard(State(state.clone()), Query(Vec::new()))
+            .await
+            .into_response(),
+    )
+    .await;
     assert!(body.contains("Focus"));
     assert!(body.contains("Submitted by stream"));
     assert!(body.contains("Submitted 19 Oct 2026 · outcome: Unknown"));
@@ -1584,6 +1589,137 @@ async fn the_dashboard_shows_the_lower_sections_from_real_records() {
     assert!(body.contains("discovered"));
 }
 
+#[test]
+fn dashboard_filter_parsing_falls_back_to_defaults() {
+    let filters = DashboardFilters::from_pairs(&[]);
+    assert!(filters.streams.is_empty());
+    assert_eq!(filters.priority, "all");
+    assert_eq!(filters.horizon_days, None);
+    assert!(!filters.show_past_due);
+    assert!(!filters.is_active());
+
+    // Invalid values fall back to the defaults, and only the first
+    // priority and horizon parameters count.
+    let filters = DashboardFilters::from_pairs(&[
+        ("priority".to_string(), "nonsense".to_string()),
+        ("priority".to_string(), "p1".to_string()),
+        ("horizon".to_string(), "banana".to_string()),
+        ("horizon".to_string(), "14".to_string()),
+        ("past_due".to_string(), "0".to_string()),
+    ]);
+    assert_eq!(filters.priority, "all");
+    assert_eq!(filters.horizon_days, None);
+    assert!(!filters.show_past_due);
+    assert!(!filters.is_active());
+}
+
+#[test]
+fn dashboard_filters_narrow_the_timeline_by_stream_priority_and_window() {
+    let as_of = days_from_civil(2026, 10, 19);
+    let mut filters = DashboardFilters::from_pairs(&[
+        ("stream".to_string(), "QI".to_string()),
+        ("priority".to_string(), "p1p2".to_string()),
+        ("horizon".to_string(), "30".to_string()),
+    ]);
+    assert!(filters.is_active());
+
+    // Wrong stream: filtered out even though everything else matches.
+    assert!(!filters.keeps("Physics", "p1", days_from_civil(2026, 10, 25), as_of));
+    // QI and P2 within the 30-day window: kept.
+    assert!(filters.keeps("QI", "p2", days_from_civil(2026, 11, 5), as_of));
+    // P3 dropped by the priority filter.
+    assert!(!filters.keeps("QI", "p3", days_from_civil(2026, 11, 5), as_of));
+    // Beyond the horizon: dropped.
+    assert!(!filters.keeps("QI", "p1", days_from_civil(2026, 12, 1), as_of));
+    // Past due is hidden unless the deliberate flag is set; the horizon
+    // bounds the future only, never the past.
+    assert!(!filters.keeps("QI", "p2", days_from_civil(2026, 10, 15), as_of));
+    filters.show_past_due = true;
+    assert!(filters.keeps("QI", "p2", days_from_civil(2026, 10, 15), as_of));
+}
+
+#[tokio::test]
+async fn the_dashboard_filters_apply_from_query_parameters() {
+    let state = test_state().await;
+
+    // The Physics P1 entry (its deadline is far in the future) …
+    assert_redirect(create_opportunity(State(state.clone()), Form(university_pairs())).await);
+    // … a P3 IT entry with a nearer deadline …
+    let mut it_pairs = university_pairs();
+    for pair in it_pairs.iter_mut() {
+        match pair.0.as_str() {
+            "organization" => pair.1 = "Kobalt Systems GmbH".to_string(),
+            "title" => pair.1 = "Full-stack engineer".to_string(),
+            "stream" => pair.1 = "IT".to_string(),
+            "priority" => pair.1 = "p3".to_string(),
+            "deadline_date" => pair.1 = "2026-11-20".to_string(),
+            _ => {}
+        }
+    }
+    assert_redirect(create_opportunity(State(state.clone()), Form(it_pairs)).await);
+    // … and a past-due Physics entry.
+    let mut past_pairs = university_pairs();
+    for pair in past_pairs.iter_mut() {
+        match pair.0.as_str() {
+            "organization" => pair.1 = "Helios Solar Research".to_string(),
+            "title" => pair.1 = "Research engineer".to_string(),
+            "priority" => pair.1 = "p3".to_string(),
+            "deadline_date" => pair.1 = "2026-10-10".to_string(),
+            _ => {}
+        }
+    }
+    assert_redirect(create_opportunity(State(state.clone()), Form(past_pairs)).await);
+
+    // Default view: both columns, no past-due row.
+    let body = body_string(
+        dashboard(State(state.clone()), Query(Vec::new()))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(body.contains("col-head\">Physics<"));
+    assert!(body.contains("col-head\">IT<"));
+    assert!(!body.contains("Helios"));
+
+    // Priority filter: only the P1 Physics column remains.
+    let body = body_string(
+        dashboard(
+            State(state.clone()),
+            Query(vec![("priority".to_string(), "p1".to_string())]),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert!(body.contains("col-head\">Physics<"));
+    assert!(!body.contains("col-head\">IT<"));
+
+    // Stream filter: only the IT column remains.
+    let body = body_string(
+        dashboard(
+            State(state.clone()),
+            Query(vec![("stream".to_string(), "IT".to_string())]),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert!(body.contains("col-head\">IT<"));
+    assert!(!body.contains("col-head\">Physics<"));
+
+    // The deliberate past-due path reveals the missed record.
+    let body = body_string(
+        dashboard(
+            State(state.clone()),
+            Query(vec![("past_due".to_string(), "1".to_string())]),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert!(body.contains("Helios"));
+}
+
 #[tokio::test]
 async fn dashboard_lists_deadlines_and_moves_submitted_out() {
     let state = test_state().await;
@@ -1592,7 +1728,12 @@ async fn dashboard_lists_deadlines_and_moves_submitted_out() {
         .into_response();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    let body = body_string(
+        dashboard(State(state.clone()), Query(Vec::new()))
+            .await
+            .into_response(),
+    )
+    .await;
     assert!(body.contains("Universität Schneckenhausen — PhD position, low-temperature physics"));
     assert!(body.contains("15 Jan 2027"));
     assert!(body.contains("/opportunities/1"));
@@ -1610,7 +1751,12 @@ async fn dashboard_lists_deadlines_and_moves_submitted_out() {
             .await,
     );
 
-    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    let body = body_string(
+        dashboard(State(state.clone()), Query(Vec::new()))
+            .await
+            .into_response(),
+    )
+    .await;
     // The timeline is empty now; the entry moved to the submitted summary.
     assert!(body.contains("No upcoming deadlines"));
     assert!(body.contains("Submitted by stream"));
@@ -1624,7 +1770,12 @@ async fn dashboard_lists_deadlines_and_moves_submitted_out() {
 #[tokio::test]
 async fn the_empty_dashboard_explains_itself_and_links_back() {
     let state = test_state().await;
-    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    let body = body_string(
+        dashboard(State(state.clone()), Query(Vec::new()))
+            .await
+            .into_response(),
+    )
+    .await;
     assert!(body.contains("No upcoming deadlines"));
     assert!(body.contains("opportunity list"));
     assert!(body.contains("as of "));
