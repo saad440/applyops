@@ -1334,3 +1334,183 @@ async fn follow_up_changes_for_a_missing_row_404() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+// --- Dashboard ---
+
+/// A stored opportunity for view-model tests, modeled on the fictional
+/// university used elsewhere in this file.
+fn stored_opportunity_with(deadline: Option<&str>) -> db::opportunities::Opportunity {
+    db::opportunities::Opportunity {
+        id: 7,
+        user_id: 1,
+        organization: "Universität Schneckenhausen".to_string(),
+        title: "Doctoral researcher".to_string(),
+        stream: "QI".to_string(),
+        city: Some("Schneckenhausen".to_string()),
+        country: Some("Testland".to_string()),
+        priority: "p2".to_string(),
+        fit_min: Some(3.5),
+        fit_max: Some(4.0),
+        effort: Some("medium".to_string()),
+        rationale: Some("Strong theory fit, lacks computing background.".to_string()),
+        deadline_date: deadline.map(str::to_string),
+        deadline_kind: deadline.map(|_| "hard_close".to_string()),
+        deadline_confidence: deadline.map(|_| "verified".to_string()),
+        source_url: Some("https://www.example.org/vacancy".to_string()),
+        recruitment_page_url: None,
+        source_notes: None,
+        notes: None,
+        stage: "discovered".to_string(),
+        created_at: "2026-10-01 10:00:00".to_string(),
+    }
+}
+
+#[test]
+fn civil_day_arithmetic_round_trips_across_eras_and_leap_years() {
+    assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(civil_from_days(0), (1970, 1, 1));
+    // 19 Oct 2026 is 4 days after 15 Oct 2026.
+    assert_eq!(
+        days_from_civil(2026, 10, 19) - days_from_civil(2026, 10, 15),
+        4
+    );
+    // Leap day exists, but not in century years that are not divisible by 400.
+    assert_eq!(
+        days_from_civil(2028, 3, 1) - days_from_civil(2028, 2, 28),
+        2
+    );
+    assert_eq!(
+        days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28),
+        1
+    );
+    assert_eq!(
+        days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28),
+        2
+    );
+
+    // Round trips across 130 years, sampled.
+    let start = days_from_civil(1970, 1, 1);
+    let end = days_from_civil(2100, 1, 1);
+    for day in (start..=end).step_by(97) {
+        let (year, month, date) = civil_from_days(day);
+        assert_eq!(days_from_civil(year, month, date), day);
+    }
+}
+
+#[test]
+fn countdown_labels_are_honest_in_both_directions() {
+    let deadline = days_from_civil(2027, 1, 15);
+    assert_eq!(countdown_label(deadline, deadline), "today");
+    assert_eq!(countdown_label(deadline, deadline - 1), "tomorrow");
+    assert_eq!(countdown_label(deadline, deadline - 2), "in 2 days");
+    assert_eq!(countdown_label(deadline, deadline - 9), "in 9 days");
+    assert_eq!(countdown_label(deadline, deadline + 1), "1 day overdue");
+    assert_eq!(countdown_label(deadline, deadline + 4), "4 days overdue");
+}
+
+#[test]
+fn iso_day_parsing_rejects_non_dates() {
+    assert_eq!(
+        parse_iso_day_number("2027-01-15"),
+        Some(days_from_civil(2027, 1, 15))
+    );
+    assert_eq!(parse_iso_day_number("19.01.2027"), None);
+    assert_eq!(parse_iso_day_number("2027-02-30"), None);
+    assert_eq!(parse_iso_day_number("2027-13-01"), None);
+    assert_eq!(parse_iso_day_number(""), None);
+    assert_eq!(parse_iso_day_number("15 Jan 2027"), None);
+}
+
+#[test]
+fn dashboard_entries_carry_display_fields_and_urgency() {
+    // Fixed as-of date so the displayed urgency is deterministic.
+    let as_of = days_from_civil(2026, 10, 19);
+
+    let overdue =
+        DeadlineEntryVm::from_opportunity(&stored_opportunity_with(Some("2026-10-15")), as_of);
+    assert_eq!(
+        overdue.heading,
+        "Universität Schneckenhausen — Doctoral researcher"
+    );
+    assert_eq!(
+        overdue.subtitle,
+        "QI · P2 · Schneckenhausen, Testland"
+    );
+    assert_eq!(overdue.deadline_display, "15 Oct 2026");
+    assert_eq!(
+        overdue.deadline_detail.as_deref(),
+        Some("Hard close · Verified")
+    );
+    assert_eq!(overdue.countdown_display.as_deref(), Some("4 days overdue"));
+    assert!(overdue.overdue);
+    assert_eq!(overdue.priority_class, "p2");
+    assert_eq!(
+        overdue.meta_display.as_deref(),
+        Some("Fit 3.5–4/5 · Effort Medium")
+    );
+    let external = overdue.external_link.as_ref().unwrap();
+    assert_eq!(external.label, "Source");
+    assert_eq!(external.url, "https://www.example.org/vacancy");
+
+    let upcoming =
+        DeadlineEntryVm::from_opportunity(&stored_opportunity_with(Some("2026-10-23")), as_of);
+    assert_eq!(upcoming.countdown_display.as_deref(), Some("in 4 days"));
+    assert!(!upcoming.overdue);
+
+    // Without a date there is no countdown and no invented one.
+    let undated = DeadlineEntryVm::from_opportunity(&stored_opportunity_with(None), as_of);
+    assert_eq!(undated.countdown_display, None);
+    assert!(!undated.overdue);
+    assert_eq!(undated.deadline_detail, None);
+}
+
+#[tokio::test]
+async fn dashboard_lists_deadlines_and_moves_submitted_out() {
+    let state = test_state().await;
+    let response = create_opportunity(State(state.clone()), Form(university_pairs()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    assert!(body.contains("Universität Schneckenhausen — PhD position, low-temperature physics"));
+    assert!(body.contains("15 Jan 2027"));
+    assert!(body.contains("/opportunities/1"));
+    // No advert URL is recorded, so the recruitment page is the external
+    // link rather than an invented one.
+    assert!(body.contains("example.org/research"));
+    assert!(body.contains("Recruitment page"));
+
+    // Confirming the submission moves the entry out of the deadline view
+    // while the opportunity itself keeps its recorded deadline.
+    assert_redirect(create_application(State(state.clone()), Path(1)).await);
+    assert_redirect(prepare_application(State(state.clone()), Path(1)).await);
+    assert_redirect(
+        record_application_submission(State(state.clone()), Path(1), Form(submission_pairs()))
+            .await,
+    );
+
+    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    assert!(!body.contains("Schneckenhausen"));
+    let stored = db::opportunities::get_opportunity(&state.db, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.deadline_date.as_deref(), Some("2027-01-15"));
+}
+
+#[tokio::test]
+async fn the_empty_dashboard_explains_itself_and_links_back() {
+    let state = test_state().await;
+    let body = body_string(dashboard(State(state.clone())).await.into_response()).await;
+    assert!(body.contains("No upcoming deadlines"));
+    assert!(body.contains("opportunity list"));
+    assert!(body.contains("as of "));
+}
+
+#[tokio::test]
+async fn the_opportunity_list_links_to_the_dashboard() {
+    let state = test_state().await;
+    let body = body_string(root(State(state), Query(Vec::new())).await.into_response()).await;
+    assert!(body.contains("<a href=\"/dashboard\">Dashboard</a>"));
+}

@@ -7,7 +7,7 @@
 
 mod db;
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use axum::Form;
@@ -213,11 +213,8 @@ impl OpportunityDetailsTemplate {
         events: Vec<ApplicationEventVm>,
         has_active_attempt: bool,
     ) -> Self {
-        let location_display = match (&opportunity.city, &opportunity.country) {
-            (Some(city), Some(country)) => Some(format!("{city}, {country}")),
-            (Some(place), None) | (None, Some(place)) => Some(place.clone()),
-            (None, None) => None,
-        };
+        let location_display =
+            format_location(opportunity.city.as_deref(), opportunity.country.as_deref());
 
         let start_attempt_label = if applications.is_empty() {
             "Start an application"
@@ -238,19 +235,10 @@ impl OpportunityDetailsTemplate {
                 .as_deref()
                 .map(format_date_human)
                 .unwrap_or_else(|| "No deadline recorded".to_string()),
-            deadline_kind_display: {
-                let kind = opportunity.deadline_kind.as_deref().map(display_label);
-                let confidence = opportunity
-                    .deadline_confidence
-                    .as_deref()
-                    .map(display_label);
-                match (kind, confidence) {
-                    (Some(kind), Some(confidence)) => Some(format!("{kind} · {confidence}")),
-                    (Some(kind), None) => Some(kind),
-                    (None, Some(confidence)) => Some(confidence),
-                    (None, None) => None,
-                }
-            },
+            deadline_kind_display: format_deadline_detail(
+                opportunity.deadline_kind.as_deref(),
+                opportunity.deadline_confidence.as_deref(),
+            ),
             notes: opportunity.notes.clone(),
             stage: opportunity.stage.clone(),
             created_at: opportunity.created_at.clone(),
@@ -543,6 +531,143 @@ struct BacklogEntryVm {
     status_display: String,
 }
 
+/// Dashboard page: the ordered next-deadlines view. The page stores nothing
+/// of its own: every request re-derives what it shows from the same stored
+/// records the other pages edit, so no second copy can drift out of date.
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+struct DashboardTemplate {
+    as_of_display: String,
+    entry_count: i64,
+    entries: Vec<DeadlineEntryVm>,
+}
+
+/// One deadline row on the dashboard, prepared for display. The internal
+/// link and the external source link stay separate, and the countdown is
+/// computed against a caller-supplied day so tests can pin urgency to a
+/// known date.
+struct DeadlineEntryVm {
+    opportunity_id: i64,
+    heading: String,
+    /// Stream, priority, and location in one line.
+    subtitle: String,
+    /// The stored priority code; validated vocabulary, used as a CSS class.
+    priority_class: String,
+    deadline_display: String,
+    /// The deadline's kind and confidence, e.g. `Hard close · Verified`.
+    deadline_detail: Option<String>,
+    countdown_display: Option<String>,
+    overdue: bool,
+    rationale: Option<String>,
+    /// Fit and effort in one line, or `None` while both are unrated.
+    meta_display: Option<String>,
+    external_link: Option<ExternalLinkVm>,
+}
+
+/// The one external link on a dashboard row: the recorded advert, or the
+/// recruitment page as a fallback, or `None` when neither exists. It stays
+/// separate from the internal details link.
+struct ExternalLinkVm {
+    label: String,
+    url: String,
+}
+
+impl DeadlineEntryVm {
+    /// Prepares one dashboard row from stored data; `as_of` is the day
+    /// number the countdown is measured against.
+    fn from_opportunity(opportunity: &db::opportunities::Opportunity, as_of: i64) -> Self {
+        let deadline_day = opportunity
+            .deadline_date
+            .as_deref()
+            .and_then(parse_iso_day_number);
+
+        let mut subtitle = format!(
+            "{} · {}",
+            opportunity.stream,
+            opportunity.priority.to_uppercase()
+        );
+        if let Some(place) =
+            format_location(opportunity.city.as_deref(), opportunity.country.as_deref())
+        {
+            subtitle.push_str(&format!(" · {place}"));
+        }
+
+        let mut meta_parts = Vec::new();
+        if let Some(fit) = format_fit(opportunity.fit_min, opportunity.fit_max) {
+            meta_parts.push(format!("Fit {fit}"));
+        }
+        if let Some(effort) = opportunity.effort.as_deref().map(display_label) {
+            meta_parts.push(format!("Effort {effort}"));
+        }
+
+        // The external link is the recorded advert when present; the
+        // recruitment page is the fallback for speculative leads. Without
+        // either, no link is shown rather than an invented one.
+        let external = opportunity
+            .source_url
+            .as_deref()
+            .map(|url| ("Source", url))
+            .or_else(|| {
+                opportunity
+                    .recruitment_page_url
+                    .as_deref()
+                    .map(|url| ("Recruitment page", url))
+            });
+
+        Self {
+            opportunity_id: opportunity.id,
+            heading: format!("{} — {}", opportunity.organization, opportunity.title),
+            subtitle,
+            priority_class: opportunity.priority.clone(),
+            deadline_display: opportunity
+                .deadline_date
+                .as_deref()
+                .map(format_date_human)
+                .unwrap_or_default(),
+            deadline_detail: format_deadline_detail(
+                opportunity.deadline_kind.as_deref(),
+                opportunity.deadline_confidence.as_deref(),
+            ),
+            countdown_display: deadline_day.map(|day| countdown_label(day, as_of)),
+            overdue: deadline_day.is_some_and(|day| day < as_of),
+            rationale: opportunity.rationale.clone(),
+            meta_display: if meta_parts.is_empty() {
+                None
+            } else {
+                Some(meta_parts.join(" · "))
+            },
+            external_link: external.map(|(label, url)| ExternalLinkVm {
+                label: label.to_string(),
+                url: url.to_string(),
+            }),
+        }
+    }
+}
+
+/// Combines the stored city and country into one place such as
+/// `Snorndorf, Testland`; a lone part appears alone.
+fn format_location(city: Option<&str>, country: Option<&str>) -> Option<String> {
+    match (city, country) {
+        (Some(city), Some(country)) => Some(format!("{city}, {country}")),
+        (Some(place), None) | (None, Some(place)) => Some(place.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Combines the deadline's kind and confidence into one label such as
+/// `Hard close · Verified`; a lone part appears alone, and a deadline with
+/// neither stays unlabeled.
+fn format_deadline_detail(kind: Option<&str>, confidence: Option<&str>) -> Option<String> {
+    let kind = kind.map(display_label);
+    let confidence = confidence.map(display_label);
+    match (kind, confidence) {
+        (Some(kind), Some(confidence)) => Some(format!("{kind} · {confidence}")),
+        (Some(kind), None) => Some(kind),
+        (None, Some(confidence)) => Some(confidence),
+        (None, None) => None,
+    }
+}
+
 /// Formats an ISO `YYYY-MM-DD` date as e.g. `15 Jan 2027` for display.
 /// Values that are not ten characters long are passed through unchanged.
 fn format_date_human(iso_date: &str) -> String {
@@ -571,6 +696,79 @@ fn format_fit(min: Option<f64>, max: Option<f64>) -> Option<String> {
         (Some(min), Some(max)) => Some(format!("{min}–{max}/5")),
         (Some(value), None) | (None, Some(value)) => Some(format!("{value}/5")),
         (None, None) => None,
+    }
+}
+
+/// Converts a calendar date to the number of days since 1970-01-01
+/// (proleptic Gregorian). Deadlines carry no time of day, so everything the
+/// dashboard computes about them is whole-day arithmetic.
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let shifted_year = i64::from(if month <= 2 { year - 1 } else { year });
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * i64::from(month_index) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: converts days since 1970-01-01 back to
+/// a `(year, month, day)` calendar date.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let shifted_days = days + 719_468;
+    let era = shifted_days.div_euclid(146_097);
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month as u32, day as u32)
+}
+
+/// Strictly parses `YYYY-MM-DD` into a day number, rejecting anything else,
+/// including impossible calendar dates. Stored deadlines are validated at
+/// the data layer, so a parse failure here only costs the countdown label.
+fn parse_iso_day_number(iso_date: &str) -> Option<i64> {
+    let (year, rest) = iso_date.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
+    let year: i32 = year.parse().ok()?;
+    let month: u32 = month.parse().ok()?;
+    let day: u32 = day.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    Some(days)
+}
+
+/// Today's day number on the UTC calendar. Deadlines are date-only and
+/// carry no timezone of their own, so the brief hour in which UTC and local
+/// calendar dates disagree after midnight is accepted for now.
+fn today_day_number() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+        .div_euclid(86_400)
+}
+
+/// The countdown text for a deadline measured against the current day.
+/// Past deadlines stay visible and say by how much.
+fn countdown_label(deadline_day: i64, as_of_day: i64) -> String {
+    match deadline_day - as_of_day {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        n if n > 1 => format!("in {n} days"),
+        -1 => "1 day overdue".to_string(),
+        n => format!("{} days overdue", -n),
     }
 }
 
@@ -851,6 +1049,7 @@ async fn main() {
     // Middleware applies to the routes registered before it.
     let app = Router::new()
         .route("/", get(root))
+        .route("/dashboard", get(dashboard))
         .route("/healthz", get(health))
         .route("/diagnostics", get(diagnostics))
         .route("/diagnostics/notes", post(create_note))
@@ -931,6 +1130,36 @@ async fn root(
         list_count: opportunities.len() as i64,
         search_query,
         opportunities,
+    })
+    .into_response()
+}
+
+/// `GET /dashboard` — the ordered next-deadlines view: every actionable
+/// opportunity that has a recorded deadline, soonest first. A confirmed
+/// submission or withdrawal moves the entry out of this list while the
+/// deadline facts on the opportunity stay untouched.
+async fn dashboard(State(state): State<AppState>) -> Response {
+    let as_of = today_day_number();
+    let (year, month, day) = civil_from_days(as_of);
+    let as_of_display = format_date_human(&format!("{year:04}-{month:02}-{day:02}"));
+
+    let opportunities = match db::dashboard::upcoming_deadlines(&state.db, 100).await {
+        Ok(opportunities) => opportunities,
+        Err(err) => {
+            tracing::error!(%err, "failed to load dashboard deadlines");
+            Vec::new()
+        }
+    };
+
+    let entries: Vec<DeadlineEntryVm> = opportunities
+        .iter()
+        .map(|opportunity| DeadlineEntryVm::from_opportunity(opportunity, as_of))
+        .collect();
+
+    HtmlTemplate(DashboardTemplate {
+        entry_count: entries.len() as i64,
+        as_of_display,
+        entries,
     })
     .into_response()
 }

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — ApplyOps{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Dashboard</h1>
+  <p class="muted">Next deadlines · {{ entry_count }} shown · as of {{ as_of_display }}</p>
+</header>
+
+{% if entries.is_empty() %}
+<section class="card">
+  <p>No upcoming deadlines.</p>
+  <p class="hint">Opportunities appear here once they have a recorded deadline date. Leads without a deadline stay in the <a href="/">opportunity list</a>.</p>
+</section>
+{% else %}
+<ol class="deadline-list">
+  {% for entry in entries %}
+  <li class="card deadline-entry priority-{{ entry.priority_class }}{% if entry.overdue %} overdue{% endif %}">
+    <div class="deadline-when">
+      <span class="deadline-date">{{ entry.deadline_display }}</span>
+      {% match entry.countdown_display %}
+      {% when Some with (countdown) %}
+      <span class="countdown">{{ countdown }}</span>
+      {% when None %}
+      {% endmatch %}
+    </div>
+    <div class="deadline-what">
+      <h2><a href="/opportunities/{{ entry.opportunity_id }}">{{ entry.heading }}</a></h2>
+      <p class="muted">{{ entry.subtitle }}</p>
+      {% match entry.deadline_detail %}
+      {% when Some with (detail) %}
+      <p class="muted">{{ detail }}</p>
+      {% when None %}
+      {% endmatch %}
+      {% match entry.rationale %}
+      {% when Some with (text) %}
+      <p class="hint">{{ text }}</p>
+      {% when None %}
+      {% endmatch %}
+      {% match entry.meta_display %}
+      {% when Some with (meta) %}
+      <p class="muted">{{ meta }}</p>
+      {% when None %}
+      {% endmatch %}
+      {% match entry.external_link %}
+      {% when Some with (link) %}
+      <p><a href="{{ link.url }}" rel="noopener noreferrer">{{ link.label }}</a></p>
+      {% when None %}
+      {% endmatch %}
+    </div>
+  </li>
+  {% endfor %}
+</ol>
+{% endif %}
+
+<p class="footer-links"><a href="/">Opportunity list</a> · <a href="/opportunities/new">Add an opportunity</a> · <a href="/reports">Report backlog</a> · <a href="/diagnostics">Diagnostics</a></p>
+{% endblock %}

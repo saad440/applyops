@@ -2027,3 +2027,137 @@ async fn no_other_workflow_creates_or_touches_follow_ups() {
             .is_empty()
     );
 }
+
+// --- Dashboard: upcoming deadlines ---
+
+/// Inserts an opportunity customized for the dashboard tests and returns
+/// its id. Deadline kind and confidence follow the date: present when a
+/// date is given, absent without one, as the validation requires.
+async fn insert_dashboard_opportunity(
+    pool: &SqlitePool,
+    deadline: Option<&str>,
+    priority: &str,
+    organization: &str,
+) -> i64 {
+    let mut new = sample_opportunity();
+    new.deadline_date = deadline.map(str::to_string);
+    new.deadline_kind = deadline.map(|_| "hard_close".to_string());
+    new.deadline_confidence = deadline.map(|_| "verified".to_string());
+    new.priority = priority.to_string();
+    new.organization = organization.to_string();
+    insert_opportunity(pool, &new).await.unwrap()
+}
+
+#[tokio::test]
+async fn dashboard_orders_deadlines_by_date_priority_then_name() {
+    let pool = migrated_pool().await;
+    let later =
+        insert_dashboard_opportunity(&pool, Some("2027-02-01"), "p1", "Aardvark College").await;
+    let p3 =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p3", "Aardvark College").await;
+    let p2 =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p2", "Aardvark College").await;
+    // Binary ordering would list "Beta Institute" first; case-insensitive
+    // ordering lists "alpha lab" first.
+    let beta =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p1", "Beta Institute").await;
+    let alpha = insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p1", "alpha lab").await;
+
+    let listed = dashboard::upcoming_deadlines(&pool, 100).await.unwrap();
+    let ids: Vec<i64> = listed.iter().map(|opportunity| opportunity.id).collect();
+    assert_eq!(ids, [alpha, beta, p2, p3, later]);
+}
+
+#[tokio::test]
+async fn dashboard_skips_archived_and_undated_opportunities() {
+    let pool = migrated_pool().await;
+    let actionable =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p2", "Alpha Institute").await;
+
+    // An archived opportunity keeps its deadline, but it is history now,
+    // not upcoming.
+    let mut archived = sample_opportunity();
+    archived.stage = "archived".to_string();
+    insert_opportunity(&pool, &archived).await.unwrap();
+
+    // No recorded deadline means the entry never was deadline material.
+    insert_dashboard_opportunity(&pool, None, "p1", "Beta Institute").await;
+
+    let listed = dashboard::upcoming_deadlines(&pool, 100).await.unwrap();
+    let ids: Vec<i64> = listed.iter().map(|opportunity| opportunity.id).collect();
+    assert_eq!(ids, [actionable]);
+}
+
+#[tokio::test]
+async fn dashboard_follows_the_latest_attempt_out_of_and_back_into_the_view() {
+    let pool = migrated_pool().await;
+    let opportunity_id =
+        insert_dashboard_opportunity(&pool, Some("2027-01-15"), "p1", "Alpha Institute").await;
+
+    // A draft or preparing attempt does not hide the deadline.
+    let id = applications::insert_application(&pool, 1, opportunity_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        dashboard::upcoming_deadlines(&pool, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A confirmed submission moves the deadline out of the view.
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-19", "email")
+        .await
+        .unwrap();
+    assert!(
+        dashboard::upcoming_deadlines(&pool, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A submission correction returns the deadline to the view.
+    applications::correct_submission_to_draft(&pool, id)
+        .await
+        .unwrap();
+    assert_eq!(
+        dashboard::upcoming_deadlines(&pool, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A genuine withdrawal removes it again.
+    applications::set_in_progress_stage(&pool, id, "preparing")
+        .await
+        .unwrap();
+    applications::record_submission(&pool, id, "2026-10-20", "email")
+        .await
+        .unwrap();
+    applications::withdraw(&pool, id).await.unwrap();
+    assert!(
+        dashboard::upcoming_deadlines(&pool, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Re-applying makes the deadline actionable again; the withdrawn
+    // attempt stays terminal and does not block the new one.
+    let reapplication = applications::insert_application(&pool, 1, opportunity_id)
+        .await
+        .unwrap();
+    assert_ne!(reapplication, id);
+    assert_eq!(
+        dashboard::upcoming_deadlines(&pool, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

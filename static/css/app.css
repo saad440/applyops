@@ -14,6 +14,12 @@
   --color-border: #dcdcd5;
   --color-error: #a13a40;
 
+  /* Priority accents for dashboard entries. Priority is user-set and is
+     never a statement about urgency; they color the left edge only. */
+  --color-priority-p1: #a13a40;
+  --color-priority-p2: #8a6d1f;
+  --color-priority-p3: #6d6d66;
+
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
@@ -39,6 +45,10 @@
     --color-accent: #7fb0d8;
     --color-border: #3a3a36;
     --color-error: #e08084;
+
+    --color-priority-p1: #e08084;
+    --color-priority-p2: #d4b25e;
+    --color-priority-p3: #a3a39b;
   }
 }
 
@@ -347,4 +357,63 @@ a {
 
 .footer-links {
   margin-top: var(--space-4);
+}
+
+/* Dashboard: ordered next-deadlines view. */
+.deadline-list {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.deadline-list h2 {
+  margin: 0 0 var(--space-1);
+  font-size: 1.1rem;
+}
+
+.deadline-list p {
+  margin: 0 0 var(--space-1);
+}
+
+.deadline-entry {
+  --entry-accent: var(--color-priority-p3);
+  border-left: 4px solid var(--entry-accent);
+  display: flex;
+  gap: var(--space-3);
+}
+
+.deadline-entry.priority-p1 {
+  --entry-accent: var(--color-priority-p1);
+}
+
+.deadline-entry.priority-p2 {
+  --entry-accent: var(--color-priority-p2);
+}
+
+.deadline-when {
+  flex-shrink: 0;
+  min-width: 8.5rem;
+}
+
+.deadline-date {
+  display: block;
+  font-weight: 600;
+}
+
+.countdown {
+  display: block;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.deadline-entry.overdue .countdown {
+  color: var(--color-error);
+  font-weight: 600;
+}
+
+.deadline-what {
+  min-width: 0;
 }
