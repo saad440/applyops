@@ -21,7 +21,14 @@
   {% endif %}
 </section>
 {% else %}
-<div class="timeline-scroll" role="region" aria-label="Deadline timeline">
+<div class="timeline-carousel">
+  <div class="timeline-arrow-rail left">
+    <button type="button" id="timeline-prev" aria-label="Show the previous columns" hidden>&#8592;</button>
+  </div>
+  <div class="timeline-arrow-rail right">
+    <button type="button" id="timeline-next" aria-label="Show the next columns" hidden>&#8594;</button>
+  </div>
+  <div class="timeline-scroll" role="region" aria-label="Deadline timeline">
   <div class="timeline" style="{{ grid_template }}">
     <div class="timeline-grid timeline-head">
       <div class="timeline-gutter timeline-date-head">Date</div>
@@ -65,6 +72,7 @@
     </div>
     {% endfor %}
   </div>
+</div>
 </div>
 {% endif %}
 
@@ -137,6 +145,47 @@
 </section>
 {% endif %}
 </div>
+
+<script>
+  (function () {
+    // Progressive enhancement: without this script the pager buttons stay
+    // hidden and the timeline keeps its native scrollbar. With it, the
+    // arrows page one stream column at a time.
+    var scroll = document.querySelector(".timeline-scroll");
+    var prev = document.getElementById("timeline-prev");
+    var next = document.getElementById("timeline-next");
+    if (!scroll || !prev || !next) return;
+
+    var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+    function stride() {
+      var heads = scroll.querySelectorAll(".timeline-col-head");
+      if (heads.length < 2) return scroll.clientWidth * 0.5;
+      return heads[1].offsetLeft - heads[0].offsetLeft;
+    }
+
+    function update() {
+      var canScroll = scroll.scrollWidth > scroll.clientWidth + 1;
+      prev.hidden = !canScroll;
+      next.hidden = !canScroll;
+      prev.disabled = scroll.scrollLeft <= 0;
+      next.disabled = scroll.scrollLeft >= scroll.scrollWidth - scroll.clientWidth - 1;
+    }
+
+    function page(direction) {
+      scroll.scrollBy({
+        left: direction * stride(),
+        behavior: reduceMotion.matches ? "auto" : "smooth",
+      });
+    }
+
+    prev.addEventListener("click", function () { page(-1); });
+    next.addEventListener("click", function () { page(1); });
+    scroll.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    update();
+  })();
+</script>
 
 <p class="footer-links constrained"><a href="/">Opportunity list</a> · <a href="/opportunities/new">Add an opportunity</a> · <a href="/reports">Report backlog</a> · <a href="/diagnostics">Diagnostics</a></p>
 {% endblock %}
