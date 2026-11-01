@@ -436,6 +436,9 @@ a {
   gap: var(--space-2);
   padding: var(--space-2);
   min-width: 0;
+  /* Long organization or title words must wrap inside the narrow grid
+     columns instead of stretching them. */
+  overflow-wrap: anywhere;
 }
 
 .deadline-entry {
@@ -496,6 +499,10 @@ a {
 .dash-section li .muted {
   display: block;
   font-size: 0.875rem;
+}
+
+.dash-section li {
+  overflow-wrap: anywhere;
 }
 
 .dash-columns {

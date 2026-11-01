@@ -13,10 +13,15 @@
 {% if rows.is_empty() %}
 <section class="card constrained">
   <p>No upcoming deadlines.</p>
-  <p class="hint">Opportunities appear here once they have a recorded deadline date. Leads without a deadline stay in the <a href="/">opportunity list</a>.</p>
+  <p class="hint">Opportunities appear here once they have a recorded deadline date.</p>
+  {% if !leads.is_empty() %}
+  <p class="hint">Leads without a deadline are listed under <a href="#leads">Open-ended leads</a> below.</p>
+  {% else %}
+  <p class="hint">Leads without a deadline stay in the <a href="/">opportunity list</a>.</p>
+  {% endif %}
 </section>
 {% else %}
-<div class="timeline-scroll">
+<div class="timeline-scroll" role="region" aria-label="Deadline timeline">
   <div class="timeline" style="{{ grid_template }}">
     <div class="timeline-grid timeline-head">
       <div class="timeline-gutter timeline-date-head">Date</div>
@@ -119,7 +124,7 @@
 {% endif %}
 
 {% if !leads.is_empty() %}
-<section class="dash-section">
+<section class="dash-section" id="leads">
   <h2>Open-ended leads</h2>
   <ul>
     {% for lead in leads %}
