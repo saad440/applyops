@@ -10,7 +10,7 @@
   <p class="muted">Deadline timeline · {{ entry_count }} shown · as of {{ as_of_display }}{% if filters_active %} · filtered{% endif %}</p>
 </header>
 
-<form method="get" action="/dashboard" class="filter-form constrained">
+<form method="get" action="/dashboard" class="filter-form constrained" aria-label="Filter the deadline timeline">
   <fieldset>
     <legend>Streams</legend>
     {% for stream in filter_streams %}
@@ -61,7 +61,7 @@
   <div class="timeline-arrow-rail right">
     <button type="button" id="timeline-next" aria-label="Show the next columns" hidden>&#8594;</button>
   </div>
-  <div class="timeline-scroll" role="region" aria-label="Deadline timeline">
+  <div class="timeline-scroll" role="region" aria-label="Deadline timeline" tabindex="0">
   <div class="timeline" style="{{ grid_template }}">
     <div class="timeline-grid timeline-head">
       <div class="timeline-gutter timeline-date-head">Date</div>

@@ -663,8 +663,26 @@ a {
 
 /* The stream chip only appears in the stacked narrow layout, where the
    column headers are gone and each card must say which stream it is. */
+/* The stream chip names the card's stream for assistive technology on the
+   wide layout, where the column headers carry that information visually;
+   the narrow layout turns it into a visible chip. */
 .stream-chip {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Native controls get the accent color and a slightly larger footprint so
+   checkbox and radio targets are comfortable to touch. */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  accent-color: var(--color-accent);
 }
 
 @media (max-width: 40rem) {
@@ -699,13 +717,19 @@ a {
   }
 
   .stream-chip {
+    position: static;
     display: inline-block;
-    margin-bottom: var(--space-1);
+    width: auto;
+    height: auto;
+    margin: 0 0 var(--space-1);
     padding: 0.05em 0.5em;
     border: 1px solid var(--color-border);
     border-radius: var(--radius);
     background: var(--color-bg);
     color: var(--color-muted);
     font-size: 0.75rem;
+    overflow: visible;
+    clip-path: none;
+    white-space: normal;
   }
 }
