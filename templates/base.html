@@ -7,7 +7,17 @@
   <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
-  <main class="page {% block page_class %}{% endblock %}">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <nav class="site-nav" aria-label="Main">
+    <ul>
+      <li><a href="/">Opportunities</a></li>
+      <li><a href="/dashboard">Dashboard</a></li>
+      <li><a href="/reports">Report backlog</a></li>
+      <li><a href="/diagnostics">Diagnostics</a></li>
+      <li><a href="/opportunities/new">Add an opportunity</a></li>
+    </ul>
+  </nav>
+  <main id="content" class="page {% block page_class %}{% endblock %}">
     {% block content %}{% endblock %}
   </main>
 </body>
