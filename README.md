@@ -1,7 +1,16 @@
 # ApplyOps
 
-ApplyOps is a local-first, single-user opportunity and application tracker.
-It is a server-rendered Rust web application backed by SQLite.
+ApplyOps is a local-first opportunity and application tracker, built with Rust, SQLite, and server-rendered HTML.
+
+The 2011 me would have written a perfectly sensible desktop application. The 2026 me, having duly considered the project's primary long-term objective (see below), deemed a full-stack architecture more appropriate.
+
+## Why ApplyOps?
+
+Keeping track of opportunities, deadlines, applications, and follow-up obligations can become very tedious. ApplyOps is intended to bring that information together in a lightweight, locally hosted application.
+
+The project is currently single-user and under active development, with an architecture that leaves room for future expansion.
+
+**The long-term objective is to make this software obsolete for its author.**
 
 ## Requirements
 
